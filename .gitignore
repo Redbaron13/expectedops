@@ -8,10 +8,10 @@ __pycache__/
 venv/
 .venv/
 
-# Configuration file (might contain user paths/settings)
+# Configuration file (user-specific)
 config.json
 
-# Database files (these change often and can become large)
+# Database files
 *.db
 *.db-journal
 
