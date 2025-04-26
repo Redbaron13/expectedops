@@ -1,0 +1,25 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment (assuming 'venv')
+venv/
+.venv/
+
+# Configuration file (might contain user paths/settings)
+config.json
+
+# Database files (these change often and can become large)
+*.db
+*.db-journal
+
+# Log files
+logs/
+*.log
+
+# IDE / OS specific files (examples)
+.idea/
+.vscode/
+*.DS_Store
