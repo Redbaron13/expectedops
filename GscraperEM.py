@@ -44,8 +44,8 @@ LC_DOCKET_VENUE_MAP = [
     (re.compile(r'\bF(G)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", "Guardianship (FG)", 1),
     (re.compile(r'\bF(P)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", "Termination of Parental Rights (FP)", 1),
     (re.compile(r'\bF([A-Z])-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", lambda m: f"Other Family ({m.group(1).upper()})", 1),
-    (re.compile(r'\bF-\d+-\d{2}\b', re.IGNORECASE), "Chancery", "Foreclosure", None),
-    (re.compile(r'\bC-\d{6}-\d{2}\b', re.IGNORECASE), "Chancery", "General Equity", None),
+    (re.compile(r'\bF-\d+-\d{2}\b', re.IGNORECASE), "Chancery Division", "Foreclosure", None),
+    (re.compile(r'\bC-\d{6}-\d{2}\b', re.IGNORECASE), "Chancery Division", "General Equity", None),
     (re.compile(r'\bSVP-\d{3}-\d{2}\b', re.IGNORECASE), "Law Division", "Civil Commitment (SVP)", None), # Venue updated
     (re.compile(r'\b[A-Z]{3}-(DC)-\d+-\d{2}\b', re.IGNORECASE), "Special Civil Part", "Special Civil (DC)", 1),
     (re.compile(r'\b[A-Z]{3}-(SC)-\d+-\d{2}\b', re.IGNORECASE), "Special Civil Part", "Small Claims (SC)", 1),
