@@ -1,4 +1,4 @@
-# GloggerEM.py
+#a GloggerEM.py
 """
 Configures logging for the application.
 """
