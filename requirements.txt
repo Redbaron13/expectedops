@@ -1,0 +1,12 @@
+requests
+beautifulsoup4
+lxml
+schedule
+pytz
+uuid
+schedule
+argparse
+datetime
+python-dateutil
+pandas
+
