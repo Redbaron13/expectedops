@@ -1,7 +1,7 @@
 # GcliEM.py
 """
 Handles CLI. Calls scheduler loop when --force is not used.
-Includes command to reset run counter.
+Includes command to reset run counter and trigger retroactive updates.
 """
 import argparse
 import logging
@@ -17,6 +17,7 @@ import GdbEM
 import GstatusEM
 import GschedulerEM # Import the scheduler module
 import GconfigEM
+import GupdaterEM   # Import the new updater module
 
 log = logging.getLogger(__name__)
 
@@ -24,10 +25,10 @@ log = logging.getLogger(__name__)
 def get_input_with_timeout(prompt, timeout, input_queue):
     """Target function for input thread."""
     try:
-        print(prompt, end='', flush=True) # Print prompt without newline
+        print(prompt, end='', flush=True)
         user_input = input()
         input_queue.put(user_input)
-    except EOFError: # Handle case where input stream is closed
+    except EOFError:
         input_queue.put(None)
     except Exception as e:
         log.error(f"Error reading input: {e}", exc_info=True)
@@ -39,25 +40,19 @@ def prompt_with_timeout(prompt_text, timeout_seconds):
     input_queue = Queue()
     input_thread = threading.Thread(target=get_input_with_timeout,
                                     args=(prompt_text, timeout_seconds, input_queue),
-                                    daemon=True) # Daemon thread exits if main thread exits
+                                    daemon=True)
     input_thread.start()
     input_thread.join(timeout=timeout_seconds)
 
     if input_thread.is_alive():
-        # Timeout occurred
         print("\nTimeout occurred.")
-        # Attempt to interrupt the input() call if possible (OS-dependent)
-        # This is tricky in Python, often requires platform-specific solutions.
-        # For simplicity, we'll just let the daemon thread terminate eventually.
         return None
     else:
-        # Thread finished within timeout
         try:
             user_input = input_queue.get_nowait()
             return user_input.strip() if user_input is not None else None
         except Empty:
              log.warning("Input thread finished but queue was empty.")
-             # This might happen if the input call was interrupted externally
              return None
 
 # --- Command Handler Functions ---
@@ -84,8 +79,6 @@ def handle_run_command(args):
         print("Initializing databases for forced run...")
         GdbEM.initialize_all_databases()
 
-        # db_files = GconfigEM.get_db_filenames() # Not directly needed here now
-
         print(f"--- Scraping Primary Source ({GscraperEM.PAGE_URL}) ---")
         log.info(f"Initiating immediate primary scrape from {GscraperEM.PAGE_URL}")
         scraped_opinions, release_date = GscraperEM.fetch_and_parse_opinions(url=GscraperEM.PAGE_URL)
@@ -93,7 +86,6 @@ def handle_run_command(args):
         if not scraped_opinions:
             print("No opinions found in this immediate run.")
             log.info("Immediate run finished. No opinions found.")
-            # Increment counter even if no data? Let's rely on save_opinions_to_dbs
             return
 
         print(f"\n--- Scraped Data ({len(scraped_opinions)} entries) ---")
@@ -127,7 +119,6 @@ def handle_run_command(args):
             print("Data marked as incorrect by user. Data will NOT be saved.")
             log.info("User marked data as incorrect. Discarding data.")
             proceed_to_save = False
-            # No edit option currently implemented
         else:
             print("Invalid input. Proceeding without validation. Data will be marked as unvalidated.")
             log.warning(f"Invalid input '{user_response}' to validation prompt. Saving as unvalidated.")
@@ -137,10 +128,9 @@ def handle_run_command(args):
         if proceed_to_save:
             print("\nProcessing entries for databases...")
             run_type = 'manual-immediate'
-            # Call the updated save function - it handles all 4 DBs for this run_type
             save_results = GdbEM.save_opinions_to_dbs(scraped_opinions, is_validated, run_type)
             print("\nDatabase processing complete:")
-            db_files = GconfigEM.get_db_filenames() # Get names for display
+            db_files = GconfigEM.get_db_filenames()
             for db_key, counts in save_results.items():
                 if counts["total"] > 0:
                     print(f"  Database '{db_key}' ({db_files.get(db_key, 'N/A')}):")
@@ -157,7 +147,7 @@ def handle_run_command(args):
 
     except FileNotFoundError as e:
          log.error(f"Configuration file not found during run: {e}", exc_info=True)
-         config_path = GconfigEM._get_config_path() # Get expected path
+         config_path = GconfigEM._get_config_path()
          print(f"Error: Configuration file '{os.path.basename(config_path)}' not found at expected location '{config_path}'.")
     except KeyError as e:
          log.error(f"Configuration key missing during run: {e}", exc_info=True)
@@ -172,14 +162,11 @@ def handle_run_command(args):
 
 def handle_status_command(args):
     log.info("Handling 'status' command.")
-    GstatusEM.display_status() # Call the updated status display
+    GstatusEM.display_status()
 
 def handle_validate_command(args):
     log.info(f"Handling 'validate' command. ID: {args.id}, Show: {args.show}")
     print("Validation functionality is not yet fully implemented.")
-    # Placeholder: Would call functions from GvalidatorEM if implemented
-    # if args.show: GvalidatorEM.list_unvalidated()
-    # if args.id: GvalidatorEM.validate_case(args.id)
     log.warning("Validation command called but not fully implemented.")
 
 def handle_configure_command(args):
@@ -203,7 +190,6 @@ def handle_configure_command(args):
              arg_name = f"db_{db_type}"
              new_filename = getattr(args, arg_name, None)
              if new_filename:
-                 # Use the pattern from GconfigEM for validation
                  if GconfigEM.DB_FILENAME_PATTERN.match(new_filename):
                      config['db_files'][db_type] = new_filename
                      print(f"{db_type.capitalize()} database filename updated to: {new_filename}")
@@ -236,15 +222,38 @@ def handle_reset_counter_command(args):
         log.error(f"Error resetting run counter: {e}", exc_info=True)
         print(f"An error occurred while resetting the counter: {e}")
 
+# --- New Handler for Retroactive Update ---
+def handle_update_old_data_command(args):
+    """Handles the 'update-old-data' command."""
+    log.info(f"Handling 'update-old-data' command. DB Key: {args.db}, Update All: {args.all}")
+    if not args.db:
+        print("Error: You must specify a database target with --db <primary|backup|all_runs|test>")
+        log.error("Missing --db argument for update-old-data command.")
+        return
+
+    if args.db not in GconfigEM.DEFAULT_DB_NAMES:
+         print(f"Error: Invalid database target '{args.db}'. Choose from: {', '.join(GconfigEM.DEFAULT_DB_NAMES.keys())}")
+         log.error(f"Invalid --db argument: {args.db}")
+         return
+
+    try:
+        scope = "all" if args.all else "unvalidated"
+        confirm = input(f"Update {scope} records in database '{args.db}' to apply current formatting rules? (y/n): ").strip().lower()
+        if confirm == 'y':
+            print(f"Starting update process for '{args.db}' ({scope} records)...")
+            GupdaterEM.run_retroactive_update(db_key=args.db, update_all=args.all)
+        else:
+            print("Update cancelled.")
+            log.info("User cancelled retroactive update.")
+    except Exception as e:
+        log.error(f"Error running retroactive update for '{args.db}': {e}", exc_info=True)
+        print(f"An error occurred during the update process: {e}")
 
 def handle_exit_command(args):
     log.info("Handling 'exit' command.")
     print("Exit command received. Stopping scheduler if running...")
-    # This doesn't forcefully stop the scheduler thread from here easily.
-    # The typical way is Ctrl+C in the terminal running the scheduler.
-    # For a programmatic exit, inter-thread communication (e.g., an event) is needed.
     log.warning("Exit command called but cannot programmatically stop scheduler from here.")
-    sys.exit(0) # Exit the CLI script itself
+    sys.exit(0)
 
 # --- Argument Parser Setup ---
 def parse_arguments():
@@ -252,7 +261,7 @@ def parse_arguments():
         prog='GmainEM',
         description='NJ Court Expected Opinions Extractor and Tracker'
     )
-    parser.add_argument('--version', action='version', version='%(prog)s 0.5.0') # Version bump
+    parser.add_argument('--version', action='version', version='%(prog)s 0.6.0') # Version bump
     subparsers = parser.add_subparsers(dest='command', help='Available commands', required=True)
 
     # --- Run Command ---
@@ -277,6 +286,12 @@ def parse_arguments():
     reset_parser = subparsers.add_parser('reset-counter', help='Reset the application run counter to 0')
     reset_parser.set_defaults(func=handle_reset_counter_command)
 
+    # --- Update Old Data Command ---
+    update_parser = subparsers.add_parser('update-old-data', help='Retroactively update formatting in a database')
+    update_parser.add_argument('--db', required=True, choices=GconfigEM.DEFAULT_DB_NAMES.keys(), help='Database to update (primary, backup, all_runs, test)')
+    update_parser.add_argument('--all', action='store_true', help='Update all records (default is only unvalidated)')
+    update_parser.set_defaults(func=handle_update_old_data_command)
+
     # --- Validate Command (Still Placeholder) ---
     validate_parser = subparsers.add_parser('validate', help='Review and mark data as validated (Not Implemented)')
     validate_parser.add_argument('--show', action='store_true', help='Show unvalidated entries')
@@ -289,9 +304,8 @@ def parse_arguments():
 
     args = parser.parse_args()
     if hasattr(args, 'func') and callable(args.func):
-        args.func(args) # Call the appropriate handler function
+        args.func(args)
     else:
-        # Should not happen if subparsers are required=True
         log.error(f"No handler function defined for command: {args.command}")
         parser.print_help()
 
