@@ -1,9 +1,21 @@
 # GscraperEM.py
+# V4: Corrected Supreme Court Docket Handling (A-##-YY)
 """
 Handles fetching and parsing the NJ Courts 'Expected Opinions' page.
+*** V4 Updates ***
+Corrected Supreme Court Docket Handling: AppDocketID = A-##-YY (short), LCdocketID = A-####-YY (long, from parens).
+Moves all other SC paren info (except Statewide) to CaseNotes.
+*** V3 Updates ***
+Handles Supreme Court cases (extracting SC Docket, App Docket, and Orig LC info).
+Handles Trial and Tax Court opinions.
+Refined LC_DOCKET_VENUE_MAP venue/subtype strings.
+Improved parsing logic based on opinion type (Supreme, Appellate, Trial, Tax).
+*** Prior Updates ***
 Refined Special Civil Part docket extraction and added specific CaseNotes format.
-Updated County Code mapping based on user input.
-Corrected Special Civil Part venue string.
+Updated County Code mapping based on user input. Corrected Special Civil Part venue string.
+Added extraction for 'Consolidated' and 'Record Impounded' flags. Set LCCounty='NJ' for agency cases.
+Added patterns for Municipal Appeal and Probate dockets. Defaults OPJURISAPP to Statewide.
+Adds note if LC Docket ID is missing.
 """
 import datetime
 import requests
@@ -12,6 +24,7 @@ import logging
 import re
 import os
 from dateutil.parser import parse as date_parse
+from dateutil.tz import gettz # For timezone awareness if needed
 
 log = logging.getLogger(__name__)
 
@@ -22,22 +35,28 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
-# Regex to find typical NJ Appellate Docket numbers (A-####-## format)
-APPELLATE_DOCKET_REGEX = re.compile(r"(A-\d{4,}-\d{2})", re.IGNORECASE)
+# Regex Patterns
+# Corrected Supreme Court Docket Regex (A-##-YY or A-#-YY)
+SUPREME_COURT_DOCKET_REGEX = re.compile(r"\b(A-\d{1,2}-\d{2})\b", re.IGNORECASE)
+# Standard Appellate Docket Regex (A-####-YY)
+APPELLATE_DOCKET_REGEX = re.compile(r"\b(A-\d{4,}-\d{2})\b", re.IGNORECASE)
+# Tax Court Docket Regex (e.g., 00xxxx-YYYY or NNNN-YYYY) - needs verification
+TAX_COURT_DOCKET_REGEX = re.compile(r"\b(\d{6}-\d{4}|\d{4}-\d{4})\b", re.IGNORECASE) # Example: 001234-2023 or 1234-2023
+
 
 # Mappings for Decision Type and Venue (of the opinion being released)
+# Updated Supreme Court definition based on docket correction
 DECISION_TYPE_MAP = {
-    "unpublished appellate": ("appUNpub", "Unpublished Appellate", "Appellate"),
-    "published appellate": ("appPUB", "Published Appellate", "Appellate"),
-    "supreme": ("supreme", "Supreme Court", "Supreme"),
-    "unpublished tax": ("taxUNpub", "Unpublished Tax", "Tax"),
-    "published tax": ("taxPUB", "Published Tax", "Tax"),
-    "unpublished trial": ("trialUNpub", "Unpublished Trial", "Trial"),
-    "published trial": ("trialPUB", "Published Trial", "Trial"),
+    "unpublished appellate": ("appUNpub", "Unpublished Appellate", "Appellate Division"),
+    "published appellate": ("appPUB", "Published Appellate", "Appellate Division"),
+    "supreme": ("supreme", "Supreme Court", "Supreme Court"), # Key used if SC docket found
+    "unpublished tax": ("taxUNpub", "Unpublished Tax", "Tax Court"),
+    "published tax": ("taxPUB", "Published Tax", "Tax Court"),
+    "unpublished trial": ("trialUNpub", "Unpublished Trial", "Trial Court"),
+    "published trial": ("trialPUB", "Published Trial", "Trial Court"),
 }
 
-# --- County Code Mapping ---
-# Updated based on user provided list (May 1, 2025)
+# --- County Code Mapping (Unchanged) ---
 COUNTY_CODE_MAP = {
     "Atlantic County": "ATL", "Bergen County": "BER", "Burlington County": "BUR",
     "Camden County": "CAM", "Cape May County": "CPM", "Cumberland County": "CUM",
@@ -49,290 +68,444 @@ COUNTY_CODE_MAP = {
 }
 
 
-# --- Lower Court Venue/Subtype Mapping ---
-# NOTE: Order matters - more specific patterns first. Venue updated for Special Civil.
+# --- Lower Court Venue/Subtype Mapping (Unchanged from V3) ---
+# This map is primarily for identifying dockets *within the parenthetical text*
 LC_DOCKET_VENUE_MAP = [
-    # Special Civil Part (with 3-letter prefix) - Captures prefix, type, digits, year
-    (re.compile(r'\b([A-Z]{3})-(DC|LT|SC)-(\d+)-(\d{2})\b', re.IGNORECASE), "Law Division - Special Civil Part", lambda m: f"Special Civil ({m.group(2).upper()})", 1), # Venue Updated
-    # Special Civil Part (without 3-letter prefix - less common but possible)
-    (re.compile(r'\b(DC|LT|SC)-(\d+)-(\d{2})\b', re.IGNORECASE), "Law Division - Special Civil Part", lambda m: f"Special Civil ({m.group(1).upper()})", 1), # Venue Updated
-    # Family (FV, FD, FM, FG, FP, Other F*)
-    (re.compile(r'\bF(V)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", "Family Violence (FV)", 1),
-    (re.compile(r'\bF(D)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", "Dissolution (FD)", 1),
-    (re.compile(r'\bF(M)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", "Dissolution (FM)", 1),
-    (re.compile(r'\bF(G)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", "Guardianship (FG)", 1),
-    (re.compile(r'\bF(P)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", "Termination of Parental Rights (FP)", 1),
-    (re.compile(r'\bF([A-Z])-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family", lambda m: f"Other Family ({m.group(1).upper()})", 1),
-    # Chancery (Foreclosure, General Equity)
-    (re.compile(r'\bF-\d+-\d{2}\b', re.IGNORECASE), "Chancery Division", "Foreclosure", None),
-    (re.compile(r'\bC-\d{6}-\d{2}\b', re.IGNORECASE), "Chancery Division", "General Equity", None),
-    # Law Division (SVP - Civil Commitment, Standard Law)
-    (re.compile(r'\bSVP-\d{3}-\d{2}\b', re.IGNORECASE), "Law Division", "Civil Commitment (SVP)", None),
-    (re.compile(r'\bL-\d{4}-\d{2}\b', re.IGNORECASE), "Law Division", None, None),
-    # Criminal (Indictment/Accusation format)
-    (re.compile(r'\b\d{2}-\d{2}-\d{4}\b'), "Criminal", None, None),
+    (re.compile(r'\b([A-Z]{3})-(DC|LT|SC)-(\d+)-(\d{2})\b', re.IGNORECASE), "Law Division", lambda m: f"Special Civil Part ({m.group(2).upper()})", 1),
+    (re.compile(r'\b(DC|LT|SC)-(\d+)-(\d{2})\b', re.IGNORECASE), "Law Division", lambda m: f"Special Civil Part ({m.group(1).upper()})", 1),
+    (re.compile(r'\bF(V)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family Division", "Family Violence (FV)", 1),
+    (re.compile(r'\bF(D)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family Division", "Dissolution (FD)", 1),
+    (re.compile(r'\bF(M)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family Division", "Dissolution (FM)", 1),
+    (re.compile(r'\bF(G)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family Division", "Guardianship (FG)", 1),
+    (re.compile(r'\bF(P)-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family Division", "Termination of Parental Rights (FP)", 1),
+    (re.compile(r'\bF([A-Z])-\d{2}-\d+-\d{2}\b', re.IGNORECASE), "Family Division", lambda m: f"Other Family ({m.group(1).upper()})", 1),
+    (re.compile(r'\bF-\d+-\d{2}\b', re.IGNORECASE), "Chancery Division", "Foreclosure Part", None),
+    (re.compile(r'\bP-\d+-\d{2}\b', re.IGNORECASE), "Chancery Division", "Probate Part", None),
+    (re.compile(r'\bC-\d+-\d{2}\b', re.IGNORECASE), "Chancery Division", "General Equity Part", None),
+    (re.compile(r'\bSVP-\d+-\d{2}\b', re.IGNORECASE), "Law Division", "Civil Commitment (SVP)", None),
+    (re.compile(r'\bL-\d+-\d{2}\b', re.IGNORECASE), "Law Division", "Civil Part", None),
+    (re.compile(r'\b(\d{2}-\d{2}-\d{4})\b'), "Law Division", "Criminal Part", None),
+    (re.compile(r'\b(\d{4}-\d{2})\b'), "Law Division - Appellate Part", "Municipal Appeal", None),
+    (re.compile(r'\b(H\d{4}-\d+)\b', re.IGNORECASE), "Agency", "Division on Civil Rights", None),
+    (re.compile(r'\b(20\d{2}-\d+)\b', re.IGNORECASE), "Agency", "State Agency Docket", None),
 ]
 
 # --- Helper Functions ---
 def _extract_text_safely(element, joiner=' '):
     """Safely extracts and joins text from a BeautifulSoup element."""
     if element:
-        return joiner.join(filter(None, [text.strip() for text in element.find_all(string=True, recursive=True)]))
+        text_nodes = element.find_all(string=True, recursive=True)
+        cleaned_text = [text.replace('\xa0', ' ').strip() for text in text_nodes]
+        return joiner.join(filter(None, cleaned_text))
     return ""
 
 def _map_decision_info(type_string):
     """Maps raw decision type text to code, text, and opinion venue."""
     type_string_lower = type_string.lower().strip() if type_string else ""
     for key, values in DECISION_TYPE_MAP.items():
-        if key in type_string_lower:
-            return values
-    log.warning(f"Unrecognized decision type string: '{type_string}'. Storing raw.")
-    return (None, type_string if type_string else "Unknown", None)
+        # Use "startswith" for more flexible matching (e.g., "Supreme Court Opinion")
+        if type_string_lower.startswith(key):
+            return values # Returns (code, text, venue) tuple
+    # If no known type matched, return unknown
+    return (None, type_string if type_string else "Unknown", "Unknown Court")
 
-# --- Case Title Parsing ---
-def _parse_case_title_details(raw_title_text):
+
+# --- Case Title Parsing (for parenthetical info) ---
+# Updated to handle SC specific note extraction
+def _parse_case_title_details(raw_title_text, opinion_type_venue="Unknown Court"):
     """
-    Parses the raw case title string to extract various details.
-    Prioritizes Special Civil Part dockets and adds specific notes.
+    Parses the raw case title string to extract details from parenthetical info.
+    Handles different expectations based on the opinion_type_venue (Supreme, Appellate, Trial, Tax).
+    For Supreme Court, finds App Div docket (A-####-YY) for LCdocketID and moves other info to CaseNotes.
     """
     details = {
-        'CaseName': raw_title_text.strip(), 'LCdocketID': None, 'LCCounty': None,
-        'OPJURISAPP': None, 'StateAgency1': None, 'StateAgency2': None,
-        'LowerCourtVenue': None, 'LowerCourtSubCaseType': None, 'CaseNotes': []
+        'CaseName': raw_title_text.strip(),
+        'LCdocketID': None, # Specific meaning varies by opinion type
+        'LCCounty': None,
+        'OPJURISAPP': "Statewide", # Default
+        'StateAgency1': None, 'StateAgency2': None,
+        'LowerCourtVenue': None, # Venue corresponding to LCdocketID
+        'LowerCourtSubCaseType': None, # Subtype corresponding to LCdocketID
+        'CaseNotes': [], # Start as list
+        'caseconsolidated': 0,
+        'recordimpounded': 0,
+        # No longer need AppellateDocketForSupreme - LCdocketID serves this for SC cases
+        # No longer need OriginalLCTextForSupreme - info goes direct to notes
     }
-    log.debug(f"Parsing raw title: {raw_title_text[:100]}...")
+    log.debug(f"Parsing raw title ({opinion_type_venue}): {raw_title_text[:100]}...")
 
+    # Separate core name from parenthetical info
     first_paren_index = raw_title_text.find('(')
     paren_content_full = ""
-    core_name = raw_title_text
+    core_name = raw_title_text.strip()
     if first_paren_index != -1:
         core_name = raw_title_text[:first_paren_index].strip()
-        paren_content_full = raw_title_text[first_paren_index:]
+        paren_content_full = raw_title_text[first_paren_index:].strip()
     details['CaseName'] = core_name
 
-    note_patterns_text = ['RECORD IMPOUNDED', 'CONSOLIDATED', 'RESUBMITTED']
+    # --- Extract Binary Flags and Remove from Paren Content ---
+    note_patterns_text = {
+        'RECORD IMPOUNDED': 'recordimpounded',
+        'CONSOLIDATED': 'caseconsolidated',
+        'RESUBMITTED': None # Keep as note
+    }
     remaining_paren_content = paren_content_full
-    extracted_notes = []
-    for note_text in note_patterns_text:
-        note_pattern = r'(?:^|[\s,(])(' + re.escape(note_text) + r')(?:$|[\s,)])'
+    extracted_notes_for_field = [] # Notes destined for the CaseNotes field
+
+    for note_text, flag_key in note_patterns_text.items():
+        note_pattern = r'(?:^|[\s,(;])\b(' + re.escape(note_text) + r')\b(?:$|[\s,);])'
         matches = list(re.finditer(note_pattern, remaining_paren_content, re.IGNORECASE))
         offset = 0
+        found_flag = False
         for match in matches:
-            extracted_notes.append(match.group(1).strip().title())
-            start, end = match.span(1)
-            adj_start = start - offset
-            adj_end = end - offset
+            matched_string = match.group(1)
+            log.debug(f"Found flag pattern '{matched_string}' in paren content.")
+            found_flag = True
+            start, end = match.span(0)
+            adj_start, adj_end = start - offset, end - offset
             remaining_paren_content = remaining_paren_content[:adj_start] + remaining_paren_content[adj_end:]
             offset += (adj_end - adj_start)
-        remaining_paren_content = remaining_paren_content.replace('()','').replace('(,','(').replace(',)',')').strip(' ,')
 
-    parts_in_parens = re.findall(r'\(([^()]*?(?:\([^()]*\)[^()]*?)*?)\)', remaining_paren_content)
-    info_elements_combined = []
-    if parts_in_parens:
-        combined_info_str = " , ".join(parts_in_parens)
-        info_elements_combined = [p.strip() for p in re.split(r'\s*,\s*(?![^()]*\))|\s+AND\s+', combined_info_str) if p.strip()]
-        log.debug(f"Extracted elements from parens: {info_elements_combined}")
+        if found_flag and flag_key:
+            details[flag_key] = 1
+            log.info(f"Set binary flag '{flag_key}'=1 for case '{core_name}'.")
+        elif found_flag and not flag_key:
+             extracted_notes_for_field.append(note_text.title()) # Add 'Resubmitted' etc. to notes
 
-    processed_elements = set()
-    agency_keywords = ["DEPARTMENT OF", "BOARD OF", "DIVISION OF", "BUREAU OF", "OFFICE OF"]
+    remaining_paren_content = re.sub(r'\s+', ' ', remaining_paren_content).strip(' ,;()')
+    log.debug(f"Paren content after flag removal: '{remaining_paren_content}'")
+
+    # --- Process remaining parenthetical content ---
+    info_elements = [p.strip() for p in re.split(r'\s*[,;]\s*|\s+AND\s+', remaining_paren_content) if p.strip()]
+    log.debug(f"Elements from remaining parens: {info_elements}")
+
+    processed_elements_indices = set() # Track indices of elements used
+    found_dockets_details = [] # Store details of *all* dockets found
+    agency_keywords = ["DEPARTMENT OF", "BOARD OF", "DIVISION OF", "BUREAU OF", "OFFICE OF", "COMMISSION"]
     is_agency_appeal = any(keyword in details['CaseName'].upper() for keyword in agency_keywords)
-    found_dockets_details = []
-    primary_lc_docket_info = None
+    found_appellate_docket_for_sc = None # Store the A-####-YY if found for SC case
+    found_county = None
+    found_opjuris = None # Store if 'Statewide' specifically found
+    found_agencies = []
 
-    for element in info_elements_combined:
-        if element in processed_elements: continue
-        for pattern, venue, subtype_info, group_index_for_subtype in LC_DOCKET_VENUE_MAP:
+    # --- Process elements ---
+    for i, element in enumerate(info_elements):
+        element_processed = False # Track if this element yields useful info
+
+        # 1. Check for Appellate Docket (A-####-YY) -> Needed for SC LCdocketID
+        app_match = APPELLATE_DOCKET_REGEX.search(element)
+        if app_match:
+            found_appellate_docket_for_sc = app_match.group(1).strip().upper()
+            log.debug(f"Found potential Appellate Docket '{found_appellate_docket_for_sc}' in parens (element {i}).")
+            processed_elements_indices.add(i)
+            element_processed = True
+            # Continue checking element for other info like county
+
+        # 2. Check for Lower Court / Agency dockets using the map
+        for pattern, venue, subtype_info, _ in LC_DOCKET_VENUE_MAP:
             matches = list(pattern.finditer(element))
             if matches:
-                log.debug(f"Pattern {pattern.pattern} matched in element '{element}'")
                 for match in matches:
-                    docket_str = match.group(0)
+                    docket_str = match.group(0).strip()
+                    # Skip if it's the long A-# we already found
+                    if docket_str.upper() == found_appellate_docket_for_sc: continue
+
                     subtype = None
                     if subtype_info:
                         if callable(subtype_info): subtype = subtype_info(match)
                         else: subtype = subtype_info
-                    docket_detail = {"docket": docket_str, "venue": venue, "subtype": subtype, "match_obj": match}
+                    docket_detail = {"docket": docket_str, "venue": venue, "subtype": subtype, "element_index": i}
                     found_dockets_details.append(docket_detail)
-                    log.debug(f"  Found LC Docket: {docket_str} -> Venue: {venue}, Subtype: {subtype}")
-                    if primary_lc_docket_info is None:
-                        primary_lc_docket_info = docket_detail
-                processed_elements.add(element)
-                break
+                    log.debug(f"  Found LC/Agency Docket Detail: {docket_str} -> Venue: {venue}, Subtype: {subtype} (element {i})")
+                processed_elements_indices.add(i)
+                element_processed = True
+                # Don't break inner loop, element might contain multiple dockets
 
-    if primary_lc_docket_info:
-        details['LowerCourtVenue'] = primary_lc_docket_info['venue']
-        details['LowerCourtSubCaseType'] = primary_lc_docket_info['subtype']
+        # 3. Check for County (if not already found and element not fully processed)
+        if not found_county and not element_processed: # Only check if not used for docket
+            county_name_match = re.search(r'(?:COUNTY\s+OF\s+)?([A-Za-z\s]+?)\s+COUNTY\b', element, re.IGNORECASE)
+            if county_name_match:
+                 county_name = county_name_match.group(1).strip().title() + " County"
+                 if county_name in COUNTY_CODE_MAP:
+                     found_county = county_name
+                     log.debug(f"Extracted LCCounty (Full Name): {found_county} (element {i})")
+                     processed_elements_indices.add(i)
+                     element_processed = True
 
-    if found_dockets_details:
-        all_docket_strings = [d['docket'] for d in found_dockets_details]
-        details['LCdocketID'] = ", ".join(all_docket_strings)
-        log.debug(f"Assigned Primary LC Venue: {details['LowerCourtVenue']}, Subtype: {details['LowerCourtSubCaseType']}")
-        log.debug(f"Combined LC Dockets field: {details['LCdocketID']}")
+            if not found_county: # Check code only if full name not found
+                 code_match = re.search(r'\b([A-Z]{3})\b', element)
+                 if code_match:
+                     county_name_from_code = next((name for name, c in COUNTY_CODE_MAP.items() if c == code_match.group(1)), None)
+                     if county_name_from_code:
+                         found_county = county_name_from_code
+                         log.debug(f"Extracted LCCounty (Code '{code_match.group(1)}'): {found_county} (element {i})")
+                         processed_elements_indices.add(i)
+                         element_processed = True
 
-    for element in info_elements_combined:
-        if element in processed_elements or details['LCCounty']: continue
-        county_match = re.search(r'(?:COUNTY\s+OF\s+)?([A-Z\s]+?)\s+COUNTY', element, re.IGNORECASE)
-        if county_match:
-            county_name = county_match.group(1).strip().title()
-            details['LCCounty'] = f"{county_name} County"
-            log.debug(f"Extracted LCCounty: {details['LCCounty']}")
-            processed_elements.add(element)
+        # 4. Check for OPJURISAPP (Statewide) (if not already found and element not fully processed)
+        if not found_opjuris and not element_processed:
+             # Use exact match for statewide within an element to avoid partials
+             if element.upper() == "STATEWIDE":
+                 found_opjuris = "Statewide"
+                 log.debug(f"Confirmed OPJURISAPP: Statewide (element {i})")
+                 processed_elements_indices.add(i)
+                 element_processed = True
+             # Add other specific jurisdictions if needed
 
-    for element in info_elements_combined:
-        if element in processed_elements or details['OPJURISAPP']: continue
-        if "STATEWIDE" in element.upper():
-            details['OPJURISAPP'] = "Statewide"
-            log.debug("Extracted OPJURISAPP: Statewide")
-            processed_elements.add(element)
+        # 5. Check for Agency Names (if element not fully processed)
+        if not element_processed:
+            if any(keyword in element.upper() for keyword in agency_keywords) and "COUNTY" not in element.upper():
+                found_agencies.append(element.strip())
+                processed_elements_indices.add(i)
+                is_agency_appeal = True
+                log.debug(f"Found potential agency name: {element.strip()} (element {i})")
+                element_processed = True
 
-    found_agencies = []
-    for element in info_elements_combined:
-        if element in processed_elements: continue
-        if any(keyword in element.upper() for keyword in agency_keywords):
-            found_agencies.append(element)
-            processed_elements.add(element)
-            is_agency_appeal = True
+
+    # --- Assign Extracted Info and Handle Leftovers ---
+    details['LCCounty'] = found_county
+    if found_opjuris: details['OPJURISAPP'] = found_opjuris # Override default only if explicitly found
 
     if found_agencies:
-         details['StateAgency1'] = found_agencies[0].strip()
-         log.debug(f"Extracted StateAgency1: {details['StateAgency1']}")
-         if len(found_agencies) > 1:
-              details['StateAgency2'] = found_agencies[1].strip()
-              log.debug(f"Extracted StateAgency2: {details['StateAgency2']}")
-              if len(found_agencies) > 2:
-                  other_agencies_note = f"Other Agencies: {', '.join(a.strip() for a in found_agencies[2:])}"
-                  extracted_notes.append(other_agencies_note)
-                  log.debug(f"Added note for other agencies: {other_agencies_note}")
+        details['StateAgency1'] = found_agencies[0]
+        if len(found_agencies) > 1: details['StateAgency2'] = found_agencies[1]
+        # Add remaining agencies to notes
+        if len(found_agencies) > 2: extracted_notes_for_field.append(f"Other Agencies: {', '.join(found_agencies[2:])}")
 
-    if is_agency_appeal and not details['LowerCourtVenue']:
-         details['LowerCourtVenue'] = "Agency"
-         log.debug("Setting LowerCourtVenue to 'Agency' based on case name/paren content.")
-         if not details['StateAgency1']:
+    # Determine primary LC Docket/Venue based on non-Appellate dockets found
+    primary_lc_docket_info = None
+    if found_dockets_details:
+        primary_lc_docket_info = found_dockets_details[0] # Default to first found
+        for docket_info in found_dockets_details:
+             if docket_info.get("venue") != "Unknown": # Prioritize known venues
+                 primary_lc_docket_info = docket_info
+                 break
+
+    # --- Type-Specific Assignments ---
+    if opinion_type_venue == "Supreme Court":
+        details['LCdocketID'] = found_appellate_docket_for_sc # A-####-YY becomes LCdocketID
+        details['LowerCourtVenue'] = "Appellate Division" # Appeal is FROM App Div
+        details['LowerCourtSubCaseType'] = None
+        # All other found info (LC Dockets, County, Agencies, unprocessed elements) goes into notes
+        if primary_lc_docket_info:
+             orig_lc_text = f"[Original LC: Docket={primary_lc_docket_info.get('docket', 'N/A')}, Venue={primary_lc_docket_info.get('venue', 'N/A')}"
+             if primary_lc_docket_info.get('subtype'): orig_lc_text += f" ({primary_lc_docket_info.get('subtype')})"
+             orig_lc_text += "]"
+             extracted_notes_for_field.insert(0, orig_lc_text)
+        # Add county if found and not part of primary LC note already
+        if found_county and (not primary_lc_docket_info or found_county not in primary_lc_docket_info.get('venue','')):
+             extracted_notes_for_field.append(f"[County: {found_county}]")
+        # Add agencies
+        if details['StateAgency1']: extracted_notes_for_field.append(f"[Agency1: {details['StateAgency1']}]")
+        if details['StateAgency2']: extracted_notes_for_field.append(f"[Agency2: {details['StateAgency2']}]")
+        # Add unprocessed elements to notes
+        for i, element in enumerate(info_elements):
+             if i not in processed_elements_indices:
+                  # Don't add back the App Docket or Statewide if OPJURISAPP is set
+                  if element.upper() == found_appellate_docket_for_sc: continue
+                  if element.upper() == "STATEWIDE" and details['OPJURISAPP'] == "Statewide": continue
+                  extracted_notes_for_field.append(element)
+
+        log.info(f"Supreme Court Case: LCdocketID='{details['LCdocketID']}', Orig LC info moved to notes.")
+
+    else: # Appellate, Trial, Tax
+        if primary_lc_docket_info:
+            details['LCdocketID'] = primary_lc_docket_info.get('docket')
+            details['LowerCourtVenue'] = primary_lc_docket_info.get('venue')
+            details['LowerCourtSubCaseType'] = primary_lc_docket_info.get('subtype')
+        # Add unprocessed elements to notes
+        for i, element in enumerate(info_elements):
+             if i not in processed_elements_indices:
+                  # Don't add back Statewide if OPJURISAPP is set
+                  if element.upper() == "STATEWIDE" and details['OPJURISAPP'] == "Statewide": continue
+                  extracted_notes_for_field.append(element)
+
+    # Set LCCounty='NJ' for Agency cases if not already set
+    if is_agency_appeal and details['LCCounty'] != 'NJ':
+        details['LCCounty'] = "NJ"
+        log.debug("Setting LCCounty='NJ' for Agency appeal.")
+        if not details['StateAgency1']: # Backfill Agency1 from case name
              for keyword in agency_keywords:
-                 if keyword in details['CaseName'].upper():
-                     match = re.search(f"({keyword}[^,(]*)", details['CaseName'], re.IGNORECASE)
-                     if match:
-                         details['StateAgency1'] = match.group(1).strip()
-                         log.debug(f"Assigned StateAgency1 from case name: {details['StateAgency1']}")
-                         break
+                 match = re.search(rf'\b({keyword}(?:\s+[A-Z][a-zA-Z]+)+)\b', details['CaseName'], re.IGNORECASE)
+                 if match:
+                     details['StateAgency1'] = match.group(1).strip()
+                     log.debug(f"Assigned StateAgency1 from case name: {details['StateAgency1']}")
+                     break
 
-    if not details['LowerCourtVenue']:
+    # Default Lower Court Venue if still unknown (unless SC case)
+    if opinion_type_venue != "Supreme Court" and not details['LowerCourtVenue']:
         details['LowerCourtVenue'] = "Unknown"
-        log.debug("Setting LowerCourtVenue to 'Unknown'.")
 
-    special_civil_note = None
-    # *** Venue check updated to match new string ***
-    if details['LowerCourtVenue'] == "Law Division - Special Civil Part" and found_dockets_details:
-        primary_sc_docket_str = None
-        # *** Venue check updated ***
-        if primary_lc_docket_info and primary_lc_docket_info['venue'] == "Law Division - Special Civil Part":
-            primary_sc_docket_str = primary_lc_docket_info['docket']
-        else:
-            for d_info in found_dockets_details:
-                 # *** Venue check updated ***
-                if d_info['venue'] == "Law Division - Special Civil Part":
-                    primary_sc_docket_str = d_info['docket']
-                    break
 
-        if primary_sc_docket_str:
-            log.debug(f"Generating Special Civil note for docket: {primary_sc_docket_str}")
-            ccc_match = re.match(r'([A-Z]{3})-', primary_sc_docket_str, re.IGNORECASE)
-            ccc = None
-            if ccc_match:
-                ccc = ccc_match.group(1).upper()
-                log.debug(f"Extracted CCC '{ccc}' from docket string.")
-                special_civil_note = f"[{primary_sc_docket_str}]" # Use full docket string as it contains CCC
-            else:
-                if details['LCCounty'] and details['LCCounty'] in COUNTY_CODE_MAP:
-                    ccc = COUNTY_CODE_MAP[details['LCCounty']]
-                    log.debug(f"Using CCC '{ccc}' from LCCounty map.")
-                    special_civil_note = f"[{ccc}-{primary_sc_docket_str}]" # Prepend CCC if not in docket
-                else:
-                    log.warning(f"Could not determine 3-letter county code for Special Civil case. LCCounty: {details['LCCounty']}")
-                    special_civil_note = f"[{primary_sc_docket_str}]"
-            log.info(f"Generated Special Civil Note: {special_civil_note}")
+    # Add missing LC docket note if applicable (excluding SC where LC = App Div)
+    if opinion_type_venue != "Supreme Court":
+        lc_id_field = details.get('LCdocketID')
+        # Add note if LCdocketID is empty AND it's not expected (e.g., not an Agency case)
+        if not lc_id_field and details['LowerCourtVenue'] != "Agency":
+            note_text = "[LC Docket Missing]"
+            if note_text not in extracted_notes_for_field:
+                 extracted_notes_for_field.append(note_text)
+                 log.warning(f"'{note_text}' for case '{core_name}' (Type: {opinion_type_venue}).")
 
-    final_notes_list = extracted_notes
-    if special_civil_note:
-        final_notes_list.insert(0, special_civil_note) # Add special note at the beginning
+    # Final notes assembly
+    final_notes_list = sorted(list(set(filter(None, extracted_notes_for_field))))
+    details['CaseNotes'] = ", ".join(final_notes_list) if final_notes_list else None
 
-    for element in info_elements_combined:
-        if element not in processed_elements:
-            final_notes_list.append(element.strip())
-
-    details['CaseNotes'] = ", ".join(filter(None, final_notes_list)) # Join notes
-
-    if details['StateAgency1'] and details['StateAgency1'].strip():
-        agency_name_to_check = details['StateAgency1'].strip()
-        normalized_case_name = re.sub(r'[\s()]+', '', details['CaseName'].upper())
-        normalized_agency_name = re.sub(r'[\s()]+', '', agency_name_to_check.upper())
-        if normalized_agency_name not in normalized_case_name:
-             details['CaseName'] += f" ({agency_name_to_check})"
-             log.debug(f"Appended agency '{agency_name_to_check}' to case name.")
-
-    log.debug(f"Parsed title details FINAL: Name='{details['CaseName'][:50]}...', LC Docket='{details['LCdocketID']}', LC Venue='{details['LowerCourtVenue']}', Notes='{details['CaseNotes']}'")
+    log.debug(f"Parsed title details FINAL ({opinion_type_venue}): Name='{details['CaseName'][:50]}...', LC Docket='{details['LCdocketID']}', LC Venue='{details['LowerCourtVenue']}', County='{details['LCCounty']}', OPJuris='{details['OPJURISAPP']}', Notes='{details['CaseNotes']}', Consol={details['caseconsolidated']}, Impound={details['recordimpounded']}")
     return details
 
-# --- _parse_case_article ---
-def _parse_case_article(article_element):
-    """Parses a single <article> element containing case information."""
+
+# --- _parse_case_article (Updated for SC Docket Logic) ---
+def _parse_case_article(article_element, release_date_iso):
+    """
+    Parses a single <article> element containing case information.
+    Handles different logic based on detected opinion type (Supreme, Appellate, Trial, Tax).
+    Correctly identifies SC dockets (A-##-YY).
+    """
     case_data_list = []
     log.debug("Parsing case article...")
+    raw_title_text = "N/A" # For error logging
     try:
         card_body = article_element.find('div', class_='card-body')
         if not card_body:
             log.warning("Article missing card-body div. Skipping.")
             return None
 
-        no_opinions_div = card_body.find('div', class_='card-title text-start mb-2')
-        if no_opinions_div:
-            no_opinions_text = _extract_text_safely(no_opinions_div)
-            if "no" in no_opinions_text.lower() and "opinions reported" in no_opinions_text.lower():
-                log.info(f"Skipping 'No opinions reported' message: '{no_opinions_text}'")
-                return None
+        no_opinions_message = card_body.find(string=re.compile(r'no\s+.*\s+opinions\s+reported', re.IGNORECASE))
+        if no_opinions_message:
+            log.info(f"Skipping 'No opinions reported' message: '{no_opinions_message.strip()}'")
+            return None
 
-        title_div = card_body.find('div', class_='card-title fw-bold text-start')
+        title_div = card_body.find('div', class_=re.compile(r'card-title\b.*\btext-start\b'))
         if not title_div:
-             log.warning("Could not find primary title div (card-title fw-bold text-start). Skipping article.")
-             return None
+            log.warning("Could not find title div (card-title text-start). Skipping article.")
+            return None
 
         raw_title_text = _extract_text_safely(title_div)
         if not raw_title_text:
-             log.warning("Title div found but contained no text. Skipping article.")
-             return None
-        title_details = _parse_case_title_details(raw_title_text)
+            log.warning("Title div found but contained no text. Skipping article.")
+            return None
 
+        # --- Identify Opinion Type and Primary Docket from Badges ---
         badge_spans = card_body.find_all('span', class_='badge')
-        raw_docket_id_text, raw_decision_type_text = None, None
+        primary_docket_id = None
+        primary_docket_badge_text = None # Store the text where the primary docket was found
+        raw_decision_type_text = None
+        decision_code, decision_text, opinion_type_venue = None, None, "Unknown Court"
+
+        # First pass: Find the primary docket ID - this determines the type
         for span in badge_spans:
-            span_text = _extract_text_safely(span)
-            if APPELLATE_DOCKET_REGEX.search(span_text):
-                 raw_docket_id_text = span_text
-            elif any(k in span_text.lower() for k in DECISION_TYPE_MAP.keys()):
-                 raw_decision_type_text = span_text
+            span_text = _extract_text_safely(span).strip()
+            if not span_text: continue
 
-        if not raw_docket_id_text:
-            case_name_for_log = title_details.get('CaseName', raw_title_text[:50] + "...")
-            log.warning(f"Could not find Appellate Docket ID badge for case '{case_name_for_log}'. Skipping.")
+            # Check for Supreme Court Docket (A-##-YY) FIRST
+            sc_match = SUPREME_COURT_DOCKET_REGEX.search(span_text)
+            if sc_match:
+                primary_docket_id = sc_match.group(1).strip().upper()
+                primary_docket_badge_text = span_text
+                opinion_type_venue = "Supreme Court"
+                decision_code, decision_text, _ = DECISION_TYPE_MAP["supreme"]
+                log.debug(f"Identified Opinion Type: Supreme Court based on docket '{primary_docket_id}' from badge '{span_text}'")
+                break # Found primary docket and type
+
+            # Check for Appellate Docket (A-####-YY)
+            app_match = APPELLATE_DOCKET_REGEX.search(span_text)
+            if app_match:
+                primary_docket_id = app_match.group(1).strip().upper()
+                primary_docket_badge_text = span_text
+                opinion_type_venue = "Appellate Division" # Assume App Div if long A-# found
+                log.debug(f"Identified Opinion Type: Appellate Division based on docket '{primary_docket_id}' from badge '{span_text}'")
+                # Decision type (pub/unpub) will be found in second pass
+                break
+
+            # Check for Tax Court Docket
+            tax_match = TAX_COURT_DOCKET_REGEX.search(span_text)
+            if tax_match:
+                primary_docket_id = tax_match.group(1).strip().upper()
+                primary_docket_badge_text = span_text
+                opinion_type_venue = "Tax Court"
+                log.debug(f"Identified Opinion Type: Tax Court based on docket '{primary_docket_id}' from badge '{span_text}'")
+                break
+
+            # Check for Trial Court Dockets (using LC map)
+            # This is less reliable as badges might contain other numbers
+            # Only do this if no other type was identified yet
+            for pattern, _, _, _ in LC_DOCKET_VENUE_MAP:
+                 # Use fullmatch - the badge *is* the docket
+                 match = pattern.fullmatch(span_text)
+                 if match:
+                     primary_docket_id = match.group(0).strip().upper()
+                     primary_docket_badge_text = span_text
+                     opinion_type_venue = "Trial Court"
+                     log.debug(f"Identified Opinion Type: Trial Court based on docket '{primary_docket_id}' from badge '{span_text}'")
+                     break # Stop inner loop
+            if opinion_type_venue == "Trial Court": break # Stop outer loop
+
+        # Second pass: Find the decision type text (Pub/Unpub) if not SC
+        if opinion_type_venue != "Supreme Court":
+            for span in badge_spans:
+                 span_text = _extract_text_safely(span).strip()
+                 if not span_text or span_text == primary_docket_badge_text: continue
+
+                 mapped_code, mapped_text, mapped_venue = _map_decision_info(span_text)
+                 # Ensure the mapped venue matches the docket type found
+                 # Or if docket type was unknown initially, use the type badge venue
+                 if mapped_code and (mapped_venue == opinion_type_venue or opinion_type_venue == "Unknown Court"):
+                     decision_code, decision_text = mapped_code, mapped_text
+                     if opinion_type_venue == "Unknown Court": # Update venue if found via type badge
+                          opinion_type_venue = mapped_venue
+                     raw_decision_type_text = span_text
+                     log.debug(f"Found Decision Type Text: {decision_text} from badge '{span_text}' (Matches Venue: {opinion_type_venue})")
+                     break # Found type
+
+        # --- CRITICAL: Primary Docket ID is required ---
+        if not primary_docket_id:
+            log.warning(f"Could not find Primary Docket ID badge for case '{raw_title_text[:50]}...'. Skipping article.")
+            log.debug(f"Badges found: {[(_extract_text_safely(s)) for s in badge_spans]}")
             return None
 
-        decision_code, decision_text, venue = _map_decision_info(raw_decision_type_text)
+        # If decision type still not found, set defaults
+        if not decision_code:
+             log.warning(f"Could not determine decision type (pub/unpub) for {primary_docket_id}. Using defaults.")
+             decision_text = f"Unknown {opinion_type_venue} Type"
+             # Assign a generic code? or leave None? Let's leave None
+             # decision_code = f"{opinion_type_venue.lower().replace(' ','')[:4]}UNK"
 
-        app_docket_ids = APPELLATE_DOCKET_REGEX.findall(raw_docket_id_text)
-        if not app_docket_ids:
-            log.warning(f"Regex failed to extract AppDocket IDs from text '{raw_docket_id_text}'. Skipping.")
-            return None
 
-        for i, primary_docket in enumerate(app_docket_ids):
-            linked_dockets = [d for j, d in enumerate(app_docket_ids) if i != j]
+        # --- Parse Title Details (Parenthetical Info) ---
+        title_details = _parse_case_title_details(raw_title_text, opinion_type_venue)
 
+
+        # Handle potential multiple primary dockets listed in the badge
+        all_primary_dockets = [primary_docket_id] # Start with the one identified
+        if primary_docket_badge_text:
+             # Try finding others matching the primary type's regex
+             docket_regex = None
+             if opinion_type_venue == "Supreme Court": docket_regex = SUPREME_COURT_DOCKET_REGEX
+             elif opinion_type_venue == "Appellate Division": docket_regex = APPELLATE_DOCKET_REGEX
+             elif opinion_type_venue == "Tax Court": docket_regex = TAX_COURT_DOCKET_REGEX
+
+             if docket_regex:
+                  found_in_badge = docket_regex.findall(primary_docket_badge_text)
+                  if len(found_in_badge) > 1:
+                       all_primary_dockets = [d.strip().upper() for d in found_in_badge]
+                       log.debug(f"Found multiple primary dockets in badge: {all_primary_dockets}")
+             # Add logic for Trial Court if needed, though less likely in single badge
+
+
+        # --- Create Data Records ---
+        for i, current_primary_docket in enumerate(all_primary_dockets):
+            linked_dockets = [d for j, d in enumerate(all_primary_dockets) if i != j]
+
+            # Assign fields based on parsed details and opinion type
             case_data = {
-                "AppDocketID": primary_docket.strip(),
+                "AppDocketID": current_primary_docket,
+                "ReleaseDate": release_date_iso,
                 "LinkedDocketIDs": ", ".join(linked_dockets) if linked_dockets else None,
                 "CaseName": title_details.get('CaseName'),
-                "LCdocketID": title_details.get('LCdocketID'),
+                "LCdocketID": title_details.get('LCdocketID'), # Correctly set by title parser based on type
                 "LCCounty": title_details.get('LCCounty'),
-                "Venue": venue,
+                "Venue": opinion_type_venue, # Venue of the court issuing this opinion
                 "LowerCourtVenue": title_details.get('LowerCourtVenue'),
                 "LowerCourtSubCaseType": title_details.get('LowerCourtSubCaseType'),
                 "OPJURISAPP": title_details.get('OPJURISAPP'),
@@ -341,18 +514,21 @@ def _parse_case_article(article_element):
                 "StateAgency1": title_details.get('StateAgency1'),
                 "StateAgency2": title_details.get('StateAgency2'),
                 "CaseNotes": title_details.get('CaseNotes'),
-                "ReleaseDate": ""
+                "caseconsolidated": title_details.get('caseconsolidated', 0),
+                "recordimpounded": title_details.get('recordimpounded', 0)
             }
-            log.debug(f"Parsed data: AppD={case_data['AppDocketID']}, LCVen={case_data['LowerCourtVenue']}, LCSub={case_data['LowerCourtSubCaseType']}, Ag1={case_data['StateAgency1']}, Notes={case_data['CaseNotes'][:50]}...")
+            log.debug(f"Parsed data record: AppD={case_data['AppDocketID']}, LCK={case_data['LCdocketID']}, LCVen={case_data['LowerCourtVenue']}, Venue={case_data['Venue']}, Notes={case_data['CaseNotes']}")
             case_data_list.append(case_data)
 
         return case_data_list
 
     except Exception as e:
-        log.error(f"Error parsing case article: {e}", exc_info=True)
-        return None
+        log.error(f"Error parsing case article (starts with '{raw_title_text[:50]}'): {e}", exc_info=True)
+        log.debug(f"Article HTML on error: {article_element.prettify()[:500]}")
+        return None # Return None on error
 
-# --- fetch_and_parse_opinions ---
+
+# --- fetch_and_parse_opinions (Unchanged from V3) ---
 def fetch_and_parse_opinions(url=PAGE_URL):
     """Fetches the HTML from the URL and parses all opinion articles."""
     log.info(f"Attempting to fetch opinions from: {url}")
@@ -362,6 +538,7 @@ def fetch_and_parse_opinions(url=PAGE_URL):
         log.info(f"Successfully fetched URL. Status code: {response.status_code}")
     except requests.exceptions.RequestException as e:
         log.error(f"Failed to fetch URL {url}: {e}", exc_info=True)
+        print(f"Error: Could not connect to {url}. Check network connection and URL.")
         return [], None
 
     html = response.text
@@ -369,64 +546,65 @@ def fetch_and_parse_opinions(url=PAGE_URL):
     opinions = []
     release_date_str_iso = None
 
+    # --- Extract Release Date ---
     try:
-        date_header_div = soup.find('div', class_='view-header')
-        if date_header_div:
-            h2_tag = date_header_div.find('h2')
-            if h2_tag:
-                match = re.search(r'on\s+(.+)', h2_tag.get_text(), re.IGNORECASE)
-                if match:
-                    raw_date_str = match.group(1).strip()
-                    log.info(f"Extracted raw release date string: {raw_date_str}")
-                    try:
-                        release_date_dt = date_parse(raw_date_str)
-                        release_date_str_iso = release_date_dt.strftime('%Y-%m-%d')
-                        log.info(f"Parsed release date to ISO format: {release_date_str_iso}")
-                    except ValueError:
-                        log.warning(f"Could not parse date string '{raw_date_str}'. Storing raw.")
-                        release_date_str_iso = raw_date_str
-                else:
-                    log.warning("Could not find date pattern ('on ...') in H2 tag.")
+        date_header = soup.select_one('div.view-header h2')
+        if date_header:
+            date_text = _extract_text_safely(date_header)
+            match = re.search(r'on\s+(.+)', date_text, re.IGNORECASE)
+            if match:
+                raw_date_str = match.group(1).strip()
+                log.info(f"Extracted raw release date string: '{raw_date_str}'")
+                try:
+                    tzinfos = {"ET": gettz("America/New_York"), "EDT": gettz("America/New_York"), "EST": gettz("America/New_York")}
+                    release_date_dt = date_parse(raw_date_str, tzinfos=tzinfos)
+                    release_date_str_iso = release_date_dt.strftime('%Y-%m-%d')
+                    log.info(f"Parsed release date to ISO format: {release_date_str_iso}")
+                except Exception as date_err:
+                    log.warning(f"Could not parse date string '{raw_date_str}': {date_err}. Storing raw.")
+                    release_date_str_iso = raw_date_str
             else:
-                log.warning("Could not find H2 tag within view-header.")
+                log.warning(f"Could not find date pattern ('on ...') in H2 tag: '{date_text}'")
         else:
-            log.warning("Could not find 'div.view-header' containing the release date.")
+            log.warning("Could not find 'div.view-header h2' containing the release date.")
     except Exception as e:
         log.error(f"Error extracting release date: {e}", exc_info=True)
 
     if not release_date_str_iso:
-        log.warning("Release date not determined from page header.")
+        log.error("Release date could not be determined from page header. Records will lack ReleaseDate.")
+        print("Warning: Could not determine the release date for these opinions.")
 
-    content_wrapper = soup.find('div', attrs={'data-drupal-views-infinite-scroll-content-wrapper': ''})
-    if not content_wrapper:
-        log.error("Could not find main content wrapper 'data-drupal-views-infinite-scroll-content-wrapper'. Trying fallback: find all 'article' tags.")
-        case_articles = soup.find_all('article', class_='w-100')
-        if not case_articles:
-             log.error("Fallback failed. Cannot find any <article class='w-100'> tags.")
-             return [], release_date_str_iso
-        else:
-             log.warning(f"Using fallback, found {len(case_articles)} potential articles.")
+    # --- Find Case Articles ---
+    main_content = soup.find('main', id='main-content')
+    search_area = main_content if main_content else soup
+    potential_articles = search_area.find_all('article', class_='w-100')
+    if not potential_articles:
+         potential_articles = search_area.select('div.card')
+         if not potential_articles:
+              log.error("Cannot find any suitable article containers (article.w-100 or div.card).")
+              return [], release_date_str_iso
+         else:
+              log.warning(f"Using fallback selector 'div.card', found {len(potential_articles)} potential containers.")
     else:
-        case_articles = content_wrapper.find_all('article', class_='w-100')
-        log.info(f"Found {len(case_articles)} potential case articles within content wrapper.")
+         log.info(f"Found {len(potential_articles)} potential article containers using 'article.w-100'.")
 
-    if not case_articles:
-        log.info("No case articles found on the page.")
-        return [], release_date_str_iso
 
     processed_count = 0
     skipped_count = 0
-    for article in case_articles:
-        parsed_data_list = _parse_case_article(article)
+    for article_container in potential_articles:
+        parsed_data_list = _parse_case_article(article_container, release_date_str_iso)
         if parsed_data_list:
-            for parsed_data in parsed_data_list:
-                 parsed_data["ReleaseDate"] = release_date_str_iso # Assign date extracted earlier
-                 opinions.append(parsed_data)
-                 processed_count += 1
+            opinions.extend(parsed_data_list)
+            processed_count += len(parsed_data_list)
         else:
             skipped_count += 1
 
-    log.info(f"Parsing complete. Processed {processed_count} entries. Skipped {skipped_count} articles.")
+    log.info(f"Parsing complete. Successfully processed {processed_count} opinion entries. Skipped {skipped_count} containers/messages.")
+    if processed_count == 0 and skipped_count > 0:
+         log.warning("Processed 0 opinions, but skipped some containers. Check if 'No opinions reported' messages were correctly handled or if parsing errors occurred.")
+    elif processed_count == 0 and skipped_count == 0:
+         log.warning("Processed 0 opinions and skipped 0 containers. No opinion data found on the page structure.")
+
     return opinions, release_date_str_iso
 
 # === End of GscraperEM.py ===
