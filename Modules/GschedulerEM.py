@@ -144,61 +144,52 @@ def start_schedule_loop():
     initial_run_count = GconfigEM.get_run_counter()
     log.info(f"Scheduler starting. Initial Run Count: {initial_run_count}")
 
-    # Define Schedule Times (Make easily configurable if needed, but hardcoded for now)
-    primary_run_1_time = "11:00"
-    primary_run_2_time = "17:30"
-    backup_run_time = "08:00"
-    weekly_check_time = "03:00"
-
     try:
-        # Validate time formats (basic check)
-        time_pattern = r"^\d{2}:\d{2}$"
-        if not all(re.match(time_pattern, t) for t in [primary_run_1_time, primary_run_2_time, backup_run_time, weekly_check_time]):
-            log.critical("Invalid time format detected in scheduler setup. Use HH:MM.")
-            print("Error: Invalid time format in scheduler configuration.")
-            return
-
-        log.info("Configuring scheduler with new multi-run schedule:")
-        log.info(f"  Primary Run 1 (Mon-Fri): {primary_run_1_time} (Type: scheduled-primary-1)")
-        log.info(f"  Primary Run 2 (Mon-Fri): {primary_run_2_time} (Type: scheduled-primary-2)")
-        log.info(f"  Backup Run    (Tue-Sat): {backup_run_time} (Type: scheduled-backup)")
-        log.info(f"  Weekly Check  (Sun)    : {weekly_check_time} (Type: maintenance)")
-
-        print(f"--- Starting Scheduler ---")
-        print(f"Primary Run 1 (Mon-Fri) scheduled at {primary_run_1_time}")
-        print(f"Primary Run 2 (Mon-Fri) scheduled at {primary_run_2_time}")
-        print(f"Backup Run    (Tue-Sat) scheduled at {backup_run_time}")
-        print(f"Weekly Check  (Sun)     scheduled at {weekly_check_time}")
-        print("Press Ctrl+C to exit.")
+        schedule_config = GconfigEM.get_schedule()
+        log.info(f"Loaded schedule configuration: {schedule_config}")
 
         schedule.clear() # Clear any previous schedules
 
-        # Schedule Primary Runs (Mon-Fri)
-        schedule.every().monday.at(primary_run_1_time).do(run_scrape_job, run_type_tag='scheduled-primary-1').tag('primary', 'weekday')
-        schedule.every().tuesday.at(primary_run_1_time).do(run_scrape_job, run_type_tag='scheduled-primary-1').tag('primary', 'weekday')
-        schedule.every().wednesday.at(primary_run_1_time).do(run_scrape_job, run_type_tag='scheduled-primary-1').tag('primary', 'weekday')
-        schedule.every().thursday.at(primary_run_1_time).do(run_scrape_job, run_type_tag='scheduled-primary-1').tag('primary', 'weekday')
-        schedule.every().friday.at(primary_run_1_time).do(run_scrape_job, run_type_tag='scheduled-primary-1').tag('primary', 'weekday')
+        # --- Schedule Runs from Config ---
+        for entry in schedule_config:
+            run_time = entry.get("time")
+            run_type = entry.get("type")
+            days = entry.get("days")
 
-        schedule.every().monday.at(primary_run_2_time).do(run_scrape_job, run_type_tag='scheduled-primary-2').tag('primary', 'weekday')
-        schedule.every().tuesday.at(primary_run_2_time).do(run_scrape_job, run_type_tag='scheduled-primary-2').tag('primary', 'weekday')
-        schedule.every().wednesday.at(primary_run_2_time).do(run_scrape_job, run_type_tag='scheduled-primary-2').tag('primary', 'weekday')
-        schedule.every().thursday.at(primary_run_2_time).do(run_scrape_job, run_type_tag='scheduled-primary-2').tag('primary', 'weekday')
-        schedule.every().friday.at(primary_run_2_time).do(run_scrape_job, run_type_tag='scheduled-primary-2').tag('primary', 'weekday')
+            if not run_time or not run_type or not days:
+                log.warning(f"Invalid schedule entry: {entry}. Skipping.")
+                continue
 
-        # Schedule Backup Run (Tue-Sat)
-        schedule.every().tuesday.at(backup_run_time).do(run_scrape_job, run_type_tag='scheduled-backup').tag('backup', 'tue-sat')
-        schedule.every().wednesday.at(backup_run_time).do(run_scrape_job, run_type_tag='scheduled-backup').tag('backup', 'tue-sat')
-        schedule.every().thursday.at(backup_run_time).do(run_scrape_job, run_type_tag='scheduled-backup').tag('backup', 'tue-sat')
-        schedule.every().friday.at(backup_run_time).do(run_scrape_job, run_type_tag='scheduled-backup').tag('backup', 'tue-sat')
-        schedule.every().saturday.at(backup_run_time).do(run_scrape_job, run_type_tag='scheduled-backup').tag('backup', 'tue-sat')
+            log.info(f"Scheduling '{run_type}' at {run_time} on {days}")
+            print(f"Scheduling '{run_type}' at {run_time} on {days}")
+
+            # Map day strings to schedule library methods
+            day_map = {
+                "Mon": schedule.every().monday, "Tue": schedule.every().tuesday,
+                "Wed": schedule.every().wednesday, "Thu": schedule.every().thursday,
+                "Fri": schedule.every().friday, "Sat": schedule.every().saturday,
+                "Sun": schedule.every().sunday
+            }
+
+            # Split days string and schedule each day
+            for day_str in days.split("-"):
+                day_method = day_map.get(day_str.capitalize())
+                if day_method:
+                    day_method.at(run_time).do(run_scrape_job, run_type_tag=f"scheduled-{run_type}").tag(run_type)
+                else:
+                    log.warning(f"Invalid day '{day_str}' in schedule entry. Skipping.")
+
+        # --- Schedule Weekly Check (Unchanged) ---
+        weekly_check_time = "03:00"
+        log.info(f"Scheduling Weekly Check at {weekly_check_time} on Sun")
+        print(f"Scheduling Weekly Check at {weekly_check_time} on Sun")
 
         # Schedule Weekly Check (Sun)
         schedule.every().sunday.at(weekly_check_time).do(check_missing_lc_dockets).tag('weekly', 'maintenance')
 
 
         # Log next run time
-        jobs = schedule.get_jobs()
+        jobs=schedule.get_jobs()
         if jobs:
             next_run_times = [job.next_run for job in jobs if job.next_run is not None]
             if next_run_times:

@@ -27,13 +27,14 @@ DEFAULT_DB_NAMES = {
 }
 
 # Initialize default timestamps to None
-DEFAULT_TIMESTAMPS = {key: None for key in DEFAULT_DB_NAMES.keys()}
+DEFAULT_TIMESTAMPS = {key: None for key in DEFAULT_DB_NAMES}
 
 DEFAULT_CONFIG = {
-    "schedule": { # Note: schedule times are now hardcoded in GschedulerEM.py as requested
-        "primary": "11:00", # Default remains for reference if needed elsewhere
-        "backup": "08:00"  # Default remains for reference
-    },
+    "schedule": [
+        {"time": "11:00", "type": "primary-1", "days": "Mon-Fri"},
+        {"time": "17:30", "type": "primary-2", "days": "Mon-Fri"},
+        {"time": "08:00", "type": "backup", "days": "Tue-Sat"},
+    ],
     "db_files": DEFAULT_DB_NAMES,
     "logging": True,
     "run_counter": 0,
@@ -77,10 +78,9 @@ def load_config():
 
         # --- Merge with defaults to ensure all keys exist ---
         needs_saving = False
-        # Schedule (keep loaded value if present, else default)
-        if "schedule" not in config or not isinstance(config["schedule"], dict):
-            config["schedule"] = DEFAULT_CONFIG["schedule"]
-            needs_saving = True # If key was missing or wrong type
+        if "schedule" not in config or not isinstance(config["schedule"], list):
+            config["schedule"] = DEFAULT_CONFIG["schedule"]  # Use the list of dicts
+            needs_saving = True
         # DB Files (validate and ensure all keys)
         db_files_from_config = config.get("db_files", {})
         validated_db_files, names_were_corrected = _validate_db_filenames(db_files_from_config)
@@ -136,7 +136,7 @@ def save_config(data):
          data["db_files"] = validated_db_files # Save validated names
 
     # Ensure other top-level keys exist
-    data.setdefault("schedule", DEFAULT_CONFIG["schedule"])
+    data.setdefault("schedule", DEFAULT_CONFIG["schedule"]) # Ensure schedule is a list
     data.setdefault("logging", DEFAULT_CONFIG["logging"])
     data.setdefault("run_counter", DEFAULT_CONFIG["run_counter"])
 
@@ -192,12 +192,13 @@ def update_last_run_timestamp(db_type):
     log.info(f"Last run timestamp for '{db_type}' updated to {now_iso}")
 
 
-def get_schedule_times():
-    """Gets schedule times from config."""
-    # Note: Actual schedule times are now in GschedulerEM.py
-    # This might return outdated defaults if config isn't manually updated.
-    config = load_config()
-    return config.get("schedule", DEFAULT_CONFIG["schedule"])
+def get_schedule(): """Gets the schedule configuration from config.json."""
+    config=load_config(); return config.get("schedule", DEFAULT_CONFIG["schedule"]) # Returns the list of schedule entries
+
+
+
+
+
 
 def get_db_filenames():
     """Gets the dictionary of validated database filenames from config."""

@@ -76,8 +76,10 @@ def get_db_connection(db_filename):
     # ... (code remains the same) ...
     if not db_filename: log.error("DB missing"); raise ConnectionError("DB missing")
     db_dir = os.path.dirname(db_filename)
-    if db_dir and not os.path.exists(db_dir): try: os.makedirs(db_dir, exist_ok=True); log.info(f"Created DB dir: {db_dir}")
-    except OSError as e: log.error(f"Failed dir create {db_dir}: {e}"); raise ConnectionError("Failed dir create") from e
+    if db_dir and not os.path.exists(db_dir):
+          try: os.makedirs(db_dir, exist_ok=True); log.info(f"Created DB dir: {db_dir}")
+          except OSError as e:
+              log.error(f"Failed dir create {db_dir}: {e}"); raise ConnectionError("Failed dir create") from e
     log.debug(f"Connecting to DB: {db_filename}")
     try: conn = sqlite3.connect(db_filename, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, timeout=10.0); conn.row_factory = sqlite3.Row; return conn
     except sqlite3.Error as e: log.error(f"Failed connect {db_filename}: {e}"); raise ConnectionError("Could not connect") from e
@@ -317,12 +319,14 @@ def save_opinions_to_dbs(opinion_list, is_validated, run_type):
     if not std_targets and not ar_target: log.error(f"No targets for '{run_type}'."); return results
     # Process opinions... (code unchanged)
     if not opinion_list: log.info("No opinions to save."); return results
-    s_writes_std={k:False for k,_ in std_targets}; s_writes_hist, overall_ok = False, False
+    s_writes_std = {k: False for k, _ in std_targets}; s_writes_hist, overall_ok = False, False
     for op_orig in opinion_list:
-        if not isinstance(op_orig,dict): continue; op=op_orig.copy()
-        app_id, cname = op.get("AppDocketID"), op.get("CaseName");
-        if not app_id or not cname: continue
-        d_hash=generate_data_hash(op); u_id=generate_unique_id(d_hash, app_id); op["DataHash"], op["UniqueID"] = d_hash, u_id
+        if not isinstance(op_orig, dict):
+            continue; op = op_orig.copy()
+        app_id, cname = op.get("AppDocketID"), op.get("CaseName")
+
+
+        if not app_id or not cname: continue; d_hash = generate_data_hash(op); u_id = generate_unique_id(d_hash, app_id); op["DataHash"], op["UniqueID"] = d_hash, u_id
         op['caseconsolidated']=1 if op.get('caseconsolidated') else 0; op['recordimpounded']=1 if op.get('recordimpounded') else 0
         # Save standard
         for db_k, db_f in std_targets: results[db_k]["total"]+=1; status=add_or_update_opinion_to_db(db_f, op, is_validated, run_type);
@@ -330,18 +334,27 @@ def save_opinions_to_dbs(opinion_list, is_validated, run_type):
                                       elif status=="updated": results[db_k]["updated"]+=1; s_writes_std[db_k]=True; overall_ok=True
                                       elif status.startswith("skipped"): results[db_k]["skipped"]+=1
                                       else: results[db_k]["error"]+=1
-        # Save history
-        if ar_target: db_k_h, db_f_h = ar_target; results[db_k_h]["total"]+=1; hist_status=_save_to_all_runs_history(db_f_h, op, run_type)
-                      if hist_status=="inserted_history": results[db_k_h]["inserted_history"]+=1; s_writes_hist=True; overall_ok=True
-                      else: results[db_k_h]["error_history"]+=1
+        # Save history.
+        if ar_target:
+            db_k_h, db_f_h = ar_target; results[db_k_h]["total"] += 1
+            hist_status = _save_to_all_runs_history(db_f_h, op, run_type)
+            if hist_status == "inserted_history":
+                results[db_k_h]["inserted_history"] += 1; s_writes_hist = True; overall_ok = True
+            else:
+                results[db_k_h]["error_history"] += 1
     # Log summary... (code unchanged)
-    for db_k, res in results.items(): db_p=db_files.get(db_k,"N/A");
-                                   if res.get("error",0)==-1 or res.get("error_history",0)==-1: log.error(f"DB '{db_k}' Skipped: init error.")
-                                   elif res.get("total",0)>0:
-                                       if db_k=="all_runs": log.info(f"DB AR: Proc {res['total']}->HistIns:{res['inserted_history']}, HistErr:{res['error_history']}")
-                                       else: log.info(f"DB '{db_k}': Proc {res['total']}->Ins:{res['inserted']}, Upd:{res['updated']}, Skp:{res['skipped']}, Err:{res['error']}")
+    for db_k, res in results.items():
+
+        db_p = db_files.get(db_k, "N/A")
+        if res.get("error", 0) == -1 or res.get("error_history", 0) == -1:
+            log.error(f"DB '{db_k}' Skipped: init error.")
+        elif res.get("total", 0) > 0:
+            if db_k == "all_runs": log.info(f"DB AR: Proc {res['total']}->HistIns:{res['inserted_history']}, HistErr:{res['error_history']}")
+
+            else: log.info(f"DB '{db_k}': Proc {res['total']}->Ins:{res['inserted']}, Upd:{res['updated']}, Skp:{res['skipped']}, Err:{res['error']}")
     # Update config... (code unchanged)
-    if overall_ok: try: log.info("Updating run counter/timestamps."); GconfigEM.increment_run_counter();
+    if overall_ok:
+        try: log.info("Updating run counter/timestamps."); GconfigEM.increment_run_counter();
                          for db_k, success in s_writes_std.items():
                              if success: GconfigEM.update_last_run_timestamp(db_k)
                          if s_writes_hist: GconfigEM.update_last_run_timestamp("all_runs")

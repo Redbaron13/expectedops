@@ -28,7 +28,7 @@ def display_status():
         schedule_times = config.get("schedule", {})
         primary_time = schedule_times.get("primary", "N/A")
         backup_time = schedule_times.get("backup", "N/A")
-        logging_enabled = config.get("logging", "N/A")
+        logging_enabled=config.get("logging", "N/A")
         run_counter = config.get("run_counter", "N/A")
         last_timestamps = config.get("last_run_timestamps", GconfigEM.DEFAULT_TIMESTAMPS)
 

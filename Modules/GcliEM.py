@@ -296,6 +296,38 @@ def handle_configure_command(args):
         else: print("No valid configuration changes provided.")
     except Exception as e: log.error(f"Configure error: {e}", exc_info=True); print("Configure error.")
 
+
+def validate_schedule_entry(entry_str):
+    """Validates a schedule entry string (HH:MM,type,days)."""
+    parts = entry_str.split(",")
+    if len(parts) != 3:
+        return False, "Invalid format. Use 'HH:MM,type,days' (e.g., '14:00,primary-1,Mon-Fri')."
+
+    time_str, run_type, days_str = parts
+    if not re.match(r"^\d{2}:\d{2}$", time_str):
+        return False, "Invalid time format. Use HH:MM."
+
+    allowed_types = ["primary-1", "primary-2", "backup", "other"]  # Add "other" for custom types
+    if run_type not in allowed_types:
+        return False, f"Invalid run type. Choose from: {', '.join(allowed_types)}"
+
+    allowed_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    days = days_str.split("-")
+    if not all(day.capitalize() in allowed_days for day in days):
+        return False, f"Invalid day(s). Use abbreviations (e.g., 'Mon-Fri', 'Sun')."
+
+    return True, {"time": time_str, "type": run_type, "days": days_str}
+
+
+def handle_add_schedule_command(args):
+    """Handles the 'add-schedule' command."""
+    log.info("Handling 'add-schedule' command")
+    entry_str = prompt_for_value("Enter new schedule entry (HH:MM,type,days)", validate_schedule_entry)
+    if entry_str:
+        config = GconfigEM.load_config()
+        config["schedule"].append(entry_str)
+        GconfigEM.save_config(config)
+
 def handle_reset_counter_command(args):
     """Handles the 'reset-counter' command."""
     log.info("Handling 'reset-counter'")
@@ -334,17 +366,27 @@ def handle_merge_db(args):
 
     # --- Get Inputs Interactively ---
     def validate_source_path(path):
-        abs_path = os.path.abspath(os.path.expanduser(path)); return (True, abs_path) if os.path.exists(abs_path) and os.path.isfile(abs_path) and abs_path.lower().endswith('.db') else (False, f"Valid .db file not found: '{path}'")
+        abs_path = os.path.abspath(os.path.expanduser(path))
+        return (True, abs_path) if os.path.exists(abs_path) and os.path.isfile(abs_path) and abs_path.lower().endswith('.db') else (False, f"Valid .db file not found: '{path}'")
     source_path = prompt_for_value("Enter FULL path to SOURCE (older) .db file", validate_source_path)
     if not source_path: print("Cancelled."); return
 
     allowed_targets = ["primary", "backup", "test"]; target_prompt = f"Enter TARGET DB key ({'/'.join(allowed_targets)})"
-    def validate_target_key(key): k = key.lower(); return (True, k) if k in allowed_targets else (False, f"Choose from: {', '.join(allowed_targets)}")
+    def validate_target_key(key): 
+        k = key.lower()
+        return (True, k) if k in allowed_targets else (False, f"Choose from: {', '.join(allowed_targets)}")
     target_key = prompt_for_value(target_prompt, validate_target_key, default="test") # Default to test
     if not target_key: print("Cancelled."); return
 
-    def validate_version(v_str): 
-        try: v = int(v_str); return (True, v) if v >= 0 else (False, "Must be >= 0.") except ValueError: return False, "Must be an integer."
+    def validate_version(v_str):
+        try:
+            v = int(v_str)
+            if v >= 0:
+                return (True, v)
+            else:
+                return (False, "Must be >= 0.")
+        except ValueError:
+            return (False, "Must be an integer.")
     source_ver = prompt_for_value("Enter SCHEMA VERSION of SOURCE DB (e.g., 1, 2)", validate_version)
     if source_ver is None: print("Cancelled."); return
 
@@ -378,13 +420,23 @@ def handle_merge_db(args):
             try:
                 target_old = f"{target_path}.pre_merge_{timestamp}.old"; print(f"Moving original -> {os.path.basename(target_old)}"); os.rename(target_path, target_old); log.info(f"Original -> {target_old}")
                 print(f"Moving merged -> {os.path.basename(target_path)}"); os.rename(temp_target, target_path); log.info(f"Temp -> {target_path}"); print("\nMerge complete. Target file replaced.")
-            except OSError as e: log.error(f"Error replacing target: {e}", exc_info=True); print(f"Error replacing file: {e}.")
-        else: print("Replace cancelled. Deleting temp."); log.info("User cancelled replace. Deleting temp."); try: os.remove(temp_target) except OSError as e: log.warning(f"Cannot delete temp {temp_target}: {e}")
+            except OSError as e:
+                log.error(f"Error replacing target: {e}", exc_info=True)
+                print(f"Error replacing file: {e}.")
+        else:
+            print("Replace cancelled. Deleting temp."); log.info("User cancelled replace. Deleting temp.")
+            try:
+                os.remove(temp_target)
+            except OSError as e:
+                log.warning(f"Cannot delete temp {temp_target}: {e}")
     else: # Merge function failed or setup failed
         log.error(f"Merge process failed before completion for '{temp_target}'."); print("\nMerge process failed. Check logs.")
-        print("Deleting temporary merge file (if exists).");
+        print("Deleting temporary merge file (if exists).")
         if os.path.exists(temp_target): 
-            try: os.remove(temp_target) except OSError as e: log.warning(f"Cannot delete failed temp {temp_target}: {e}")
+            try:
+                os.remove(temp_target)
+            except OSError as e:
+                log.warning(f"Cannot delete failed temp {temp_target}: {e}")
     # Cleanup message if necessary
     if not merge_job_success or (confirm2 and confirm2.lower() != 'y'): print("Original target file unchanged. Backups preserved.")
 
@@ -401,7 +453,10 @@ def parse_arguments():
     config_parser = subparsers.add_parser('configure', help='Configure settings'); config_parser.set_defaults(func=handle_configure_command)
     for db_t, def_n in GconfigEM.DEFAULT_DB_NAMES.items(): config_parser.add_argument(f"--db-{db_t.replace('_','-')}", type=str, metavar='FN', help=f'Set {db_t} DB ({def_n})')
     config_parser.add_argument('--toggle-logging', type=lambda x: x.lower()=='true', metavar='t/f', help='Enable/disable file logging')
+
     reset_parser = subparsers.add_parser('reset-counter', help='Reset run counter'); reset_parser.set_defaults(func=handle_reset_counter_command)
+    add_schedule_parser = subparsers.add_parser('add-schedule', help='Add a new schedule entry'); add_schedule_parser.set_defaults(func=handle_add_schedule_command)
+
     validate_parser = subparsers.add_parser('validate', help='List/validate entries'); validate_parser.set_defaults(func=handle_validate_command)
     v_group = validate_parser.add_mutually_exclusive_group(required=True); v_group.add_argument('--list-unvalidated', action='store_true'); v_group.add_argument('--list-missing-lc', action='store_true'); v_group.add_argument('--validate-id', type=str, metavar='UID')
     validate_parser.add_argument('--db', choices=GconfigEM.DEFAULT_DB_NAMES.keys(), default='primary', help='Target DB (default: primary)')

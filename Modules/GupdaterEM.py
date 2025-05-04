@@ -154,7 +154,7 @@ def run_retroactive_update(db_key, update_all=False):
 
 
                 # If any updates were identified, add to batch
-                if updates:
+                if updates: 
                     updates_to_commit.append((updates, unique_id))
 
             # --- Execute Batch Update ---

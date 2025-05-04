@@ -59,7 +59,7 @@ def setup_logging():
 
     # Configure the root logger
     logging.basicConfig(level=log_level, handlers=handlers)
-
+    
     # Test message
     logging.info("Logging setup complete.")
 

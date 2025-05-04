@@ -19,7 +19,7 @@ def main():
         logging.critical(f"An unhandled error occurred: {e}", exc_info=True)
         print(f"Error: An unexpected error occurred. Check the log file '{GloggerEM.LOG_FILE}' for details.", file=sys.stderr)
         sys.exit(1) # Exit with an error code
-
+    
 if __name__ == "__main__":
     main()
 # === End of GmainEM.py ===

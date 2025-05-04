@@ -117,7 +117,7 @@ def validate_case(unique_id_to_validate, db_key="primary"): # Add db_key paramet
 
         # --- Validation Status ---
         entry.update(updated_values) # Apply field edits before asking validation
-        print("\n--- Validation Status ---")
+        print("\n--- Validation Status ---") 
         confirm_validate_input = input(f"Mark this entry as validated? (Current: {bool(original_entry['validated'])}) (y/n/Enter=no change): ").strip().lower()
         validation_changed = False
         new_validated_status = original_entry['validated']

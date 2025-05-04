@@ -189,7 +189,7 @@ def merge_old_database(source_db_path, target_db_key, source_schema_version):
 
 
                 except Exception as row_err:
-                    # Enhanced error logging for individual row processing failure
+                    # Enhanced error logging for individual row processing failure.
                     log.error(f"Error processing row (AppDocket: {app_docket}, UniqueID: {unique_id[:8]}...): {row_err}", exc_info=True) # Add traceback
                     error_row_count += 1
                     # Optionally log the problematic old_row data (be mindful of size/sensitivity)
