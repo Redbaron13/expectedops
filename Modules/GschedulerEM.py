@@ -189,18 +189,22 @@ def start_schedule_loop():
 
 
         # Log next run time
-        jobs=schedule.get_jobs()
+        jobs = schedule.get_jobs()
         if jobs:
             next_run_times = [job.next_run for job in jobs if job.next_run is not None]
             if next_run_times:
-                next_run_time = min(next_run_times)
-                # Ensure timezone information is included if possible
-                local_tz = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
-                next_run_local = next_run_time.astimezone(local_tz)
-                log.info(f"Next scheduled run at: {next_run_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                print(f"Next scheduled run at: {next_run_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                try:
+                    next_run_time = min(next_run_times)
+                    # Ensure timezone information is included if possible
+                    local_tz = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
+                    next_run_local = next_run_time.astimezone(local_tz)
+                    log.info(f"Next scheduled run at: {next_run_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    print(f"Next scheduled run at: {next_run_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                except Exception as e:
+                    log.warning(f"Could not format next run time: {e}")
+                    print("Next run time available but could not be formatted.")
             else:
-                 log.warning("Scheduled jobs exist, but next run time could not be determined.")
+                log.warning("Scheduled jobs exist, but next run time could not be determined.")
         else:
             log.warning("No scheduled jobs found after setup. Check schedule times and logic.")
 

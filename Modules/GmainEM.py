@@ -1,25 +1,17 @@
 # GmainEM.py
 """
-Main entry point for the application. Sets up logging and calls the CLI handler.
+Main entry point for ExpectedOps CLI commands.
 """
-import GcliEM
-import GloggerEM # Import the logger setup module
+import os
 import sys
+import logging
 
-def main():
-    # Set up logging as the first step
-    GloggerEM.setup_logging()
+# Add Modules directory to path if needed
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 
-    # Now proceed with the command line interface
-    try:
-        GcliEM.parse_arguments()
-    except Exception as e:
-        # Log any unhandled exceptions from the CLI/main logic
-        import logging
-        logging.critical(f"An unhandled error occurred: {e}", exc_info=True)
-        print(f"Error: An unexpected error occurred. Check the log file '{GloggerEM.LOG_FILE}' for details.", file=sys.stderr)
-        sys.exit(1) # Exit with an error code
-    
+import GcliEM
+
 if __name__ == "__main__":
-    main()
-# === End of GmainEM.py ===
+    GcliEM.main()

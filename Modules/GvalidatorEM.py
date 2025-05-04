@@ -165,8 +165,9 @@ def validate_case(unique_id_to_validate, db_key="primary"): # Add db_key paramet
             fields_to_update = list(set(fields_to_update)) # Unique fields
 
             if not fields_to_update:
-                 print("Internal check: No fields marked for update. Aborting save.")
-                 return
+                print("\nNo changes to commit.")
+                log.info(f"No changes to commit for Entry UniqueID {entry['UniqueID']}")
+                return
 
             set_clauses = ", ".join([f"{key} = ?" for key in fields_to_update])
             sql_values = [entry.get(key) for key in fields_to_update] + [entry['UniqueID']]
@@ -182,15 +183,18 @@ def validate_case(unique_id_to_validate, db_key="primary"): # Add db_key paramet
             print("Changes discarded.")
             log.info(f"User discarded changes for Entry UniqueID {entry['UniqueID']}.")
 
-    # ... (error handling remains the same) ...
     except sqlite3.Error as e:
-        log.error(f"Database error during validation of UniqueID {unique_id_to_validate} in '{db_filename}': {e}", exc_info=True)
+        log.error(f"Database error during validation: {e}", exc_info=True)
         print(f"Database error: {e}")
+        return
     except ConnectionError as e:
-         print(f"Database connection error: {e}")
+        log.error(f"Database connection error: {e}", exc_info=True)
+        print(f"Connection error: {e}")
+        return
     except Exception as e:
-         log.error(f"Unexpected error during validation of UniqueID {unique_id_to_validate}: {e}", exc_info=True)
-         print(f"An unexpected error occurred: {e}")
+        log.error(f"Unexpected error during validation: {e}", exc_info=True)
+        print(f"An unexpected error occurred: {e}")
+        return
     finally:
         if conn:
             conn.close()

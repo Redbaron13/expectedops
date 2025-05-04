@@ -116,6 +116,11 @@ def display_status():
     # TODO: Integrate with schedule library if possible to show next run time?
     # next_run = schedule.next_run # Requires access to the scheduler instance
     # print(f"  Next Scheduled Run: {schedule.next_run}") # Example if accessible
+    if jobs:
+        next_run_times = [job.next_run for job in jobs if job.next_run is not None]
+        if next_run_times:
+            next_run_time = min(next_run_times)
+            log.info(f"Next scheduled run at: {next_run_time}")  # Fixed missing quote
     print("  (Scheduler next run time check not yet implemented)")
     log.info("Scheduler status check not yet implemented in GstatusEM.")
 

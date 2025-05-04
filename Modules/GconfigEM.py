@@ -191,21 +191,17 @@ def update_last_run_timestamp(db_type):
     save_config(config)
     log.info(f"Last run timestamp for '{db_type}' updated to {now_iso}")
 
-
-def get_schedule(): """Gets the schedule configuration from config.json."""
-    config=load_config(); return config.get("schedule", DEFAULT_CONFIG["schedule"]) # Returns the list of schedule entries
-
-
-
-
-
+def get_schedule():
+    """Gets the schedule configuration from config.json."""
+    config = load_config()
+    return config.get("schedule", DEFAULT_CONFIG["schedule"])
 
 def get_db_filenames():
     """Gets the dictionary of validated database filenames from config."""
     config = load_config()
     # Ensure db_files exists and is validated before returning
     if "db_files" not in config or not isinstance(config["db_files"], dict):
-        config = load_config() # Reload/create default if missing
+        config = load_config()  # Reload/create default if missing
     return config.get("db_files", DEFAULT_DB_NAMES.copy())
 
 def is_logging_enabled():

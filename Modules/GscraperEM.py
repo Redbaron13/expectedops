@@ -24,11 +24,15 @@ except ImportError:
     from datetime import timezone, timedelta
     ZoneInfo = None # Flag that zoneinfo is not available
 
+import GsupremescraperEM  # Add import
+
 log = logging.getLogger(__name__)
 
 # Constants
 BASE_URL = "https://www.njcourts.gov"
-PAGE_URL = os.path.join(BASE_URL, "attorneys/opinions/expected")
+EXPECTED_OPINIONS_URL = "https://www.njcourts.gov/attorneys/opinions/expected"  # Full direct URL
+SUPREME_APPEALS_URL = "https://www.njcourts.gov/courts/supreme/appeals"  # Full direct URL
+PAGE_URL = EXPECTED_OPINIONS_URL  # Use this as the main scraping URL
 HEADERS = { # User Agent remains the same
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
@@ -224,6 +228,25 @@ def _parse_case_title_details(raw_title_text, opinion_type_venue="Unknown Court"
     primary_lc = found_dockets[0] if found_dockets else None
     # Type specific logic
     if opinion_type_venue == "Supreme Court":
+        # Get SC docket number first
+        sc_match = SUPREME_COURT_DOCKET_REGEX.search(raw_title_text)
+        if sc_match:
+            sc_docket = sc_match.group(1).strip().upper()
+            # Pass case caption to search function
+            sc_details = GsupremescraperEM.supreme_scraper.find_matching_case(
+                sc_docket,
+                case_caption=details['CaseName']
+            )
+            if sc_details:
+                if sc_details['app_docket']:
+                    details['LinkedDocketIDs'] = sc_details['app_docket']
+                if sc_details['county']:
+                    details['LCCounty'] = sc_details['county']
+                if sc_details['state_agency']:
+                    details['StateAgency1'] = sc_details['state_agency']
+                log.info(f"Found Supreme Court case details for {sc_docket}")
+            else:
+                log.warning(f"No additional details found for Supreme Court case {sc_docket}")
         details['LCdocketID'] = app_docket_sc
         details['LowerCourtVenue'] = "Appellate Division"
         details['LowerCourtSubCaseType'] = None

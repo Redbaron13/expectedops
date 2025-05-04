@@ -12,6 +12,7 @@ Handles CLI commands.
 - `updater`: (Informational) Explains manual update process.
 - `build-combo-db`: Manually rebuilds the combo DB.
 - `merge-db`: Interactively merges data from an older DB file. # Interactive V8
+- `supreme`: Test Supreme Court docket search.
 - `exit`: Stops the application.
 """
 import argparse
@@ -33,6 +34,7 @@ import GschedulerEM
 import GconfigEM
 import GvalidatorEM
 import GmergerEM # For merge utility
+import GsupremetestEM
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +111,7 @@ def prompt_for_value(prompt_text, validation_func=None, error_msg="Invalid input
 # --- Command Handler Functions ---
 
 def handle_run_command(args):
-    """Handles the 'run' command based on --force and --test flags."""
+    """Handles the 'run' command."""
     log.info(f"Handling 'run' command. Force: {args.force}, Test: {args.test}")
 
     if not args.force:
@@ -198,29 +200,25 @@ def handle_run_command(args):
 
             # Save (only to primary and all_runs)
             if proceed_to_save:
-                print("\nProcessing for Primary and AllRuns databases..."); save_results = GdbEM.save_opinions_to_dbs(scraped_opinions, is_validated, run_type_force); print("\nDatabase processing complete:")
-                db_files = GconfigEM.get_db_filenames()
-                # Loop for logging results (Corrected Indentation & Logic)
-                for db_key in ["primary", "all_runs"]:
-                    if db_key in save_results:
-                        counts = save_results[db_key]
-                        db_path = db_files.get(db_key, "N/A")
-                        init_error_std = counts.get("error") == -1
-                        init_error_hist = counts.get("error_history") == -1
+                print("\nProcessing for Primary and AllRuns databases..."); save_results = GdbEM.save_opinions_to_dbs(scraped_opinions, is_validated, run_type_force)
+                
+                # Initialize save_results to empty dict if None
+                if save_results is None:
+                    save_results = {}
+                    log.warning("Database save operation returned no results.")
 
-                        # Use consistent indent level here
-                        if init_error_std or init_error_hist:
-                            log.error(f"DB '{db_key}' ({db_path}): Skipped due to initialization error.")
-                            print(f"  {db_key.capitalize()} DB: Skipped (Initialization Error)")
-                        elif counts.get("total", 0) > 0:
-                            if db_key == "all_runs":
-                                ins_h = counts.get('inserted_history', 0); err_h = counts.get('error_history', 0)
-                                log.info(f"DB 'all_runs' ({db_path}): Processed {counts['total']} -> Hist Ins: {ins_h}, Hist Err: {err_h}")
-                                print(f"  AllRuns DB: History Inserted={ins_h}, Errors={err_h}")
-                            else: # Standard DB (primary)
-                                ins_s = counts.get('inserted', 0); upd_s = counts.get('updated', 0); skp_s = counts.get('skipped', 0); err_s = counts.get('error', 0)
-                                log.info(f"DB '{db_key}' ({db_path}): Processed {counts['total']} -> Ins: {ins_s}, Upd: {upd_s}, Skp: {skp_s}, Err: {err_s}")
-                                print(f"  {db_key.capitalize()} DB: Inserted={ins_s}, Updated={upd_s}, Skipped={skp_s}, Errors={err_s}")
+                print("\nDatabase processing complete:")
+                for db_key in ["primary", "all_runs"]:  # Only care about these two for force run
+                    if db_key in save_results:
+                        result = save_results[db_key]
+                        if isinstance(result, dict) and result.get("error", 0) != -1:
+                            print(f"{db_key.title()} DB: {result.get('inserted', 0)} inserted, "
+                                  f"{result.get('updated', 0)} updated, "
+                                  f"{result.get('skipped', 0)} skipped.")
+                        else:
+                            print(f"{db_key.title()} DB: Error during processing.")
+                    else:
+                        print(f"{db_key.title()} DB: No results reported.")
 
             else: # User chose not to save
                 print("Data discarded."); log.info("Forced run data discarded.")
@@ -440,34 +438,72 @@ def handle_merge_db(args):
     # Cleanup message if necessary
     if not merge_job_success or (confirm2 and confirm2.lower() != 'y'): print("Original target file unchanged. Backups preserved.")
 
+def handle_supreme_command(args):
+    """Handles the supreme search command."""
+    try:
+        results = GsupremetestEM.search_supreme_docket(
+            args.docket,
+            save_results=not args.no_save
+        )
+        
+        if results:
+            print("\nSearch Results:")
+            print(f"Supreme Docket: {results.get('sc_docket')}")
+            print(f"Appellate Docket: {results.get('app_docket')}")
+            print(f"Case Caption: {results.get('case_name')}")
+            print(f"County: {results.get('county')}")
+            print(f"State Agency: {results.get('state_agency')}")
+        else:
+            print(f"\nNo results found for docket: {args.docket}")
+            
+    except Exception as e:
+        log.error(f"Supreme search failed: {e}", exc_info=True)
+        print(f"Error during search: {e}")
+        sys.exit(1)
 
-# --- Argument Parser Setup ---
-def parse_arguments():
-    parser = argparse.ArgumentParser(prog='GmainEM', description='NJ Court Opinions Extractor', formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('--version', action='version', version='%(prog)s 1.0.1')
+def setup_parser():
+    """Sets up command line argument parser."""
+    parser = argparse.ArgumentParser(description='ExpectedOps CLI Tool')
     subparsers = parser.add_subparsers(dest='command', help='Available commands', required=True)
-    # Run Command
-    run_parser = subparsers.add_parser('run', help='Run extraction or scheduler.', description='Default: Scheduler.\n--force: Immediate primary->P+AR.\n--force --test: Simulate runs->All DBs.'); run_parser.add_argument('--force', action='store_true'); run_parser.add_argument('--test', action='store_true'); run_parser.set_defaults(func=handle_run_command)
-    # Status, Configure, Reset, Validate, Updater, Build-Combo, Exit...
-    status_parser = subparsers.add_parser('status', help='Show status'); status_parser.set_defaults(func=handle_status_command)
-    config_parser = subparsers.add_parser('configure', help='Configure settings'); config_parser.set_defaults(func=handle_configure_command)
-    for db_t, def_n in GconfigEM.DEFAULT_DB_NAMES.items(): config_parser.add_argument(f"--db-{db_t.replace('_','-')}", type=str, metavar='FN', help=f'Set {db_t} DB ({def_n})')
-    config_parser.add_argument('--toggle-logging', type=lambda x: x.lower()=='true', metavar='t/f', help='Enable/disable file logging')
+    
+    # Add supreme search command
+    supreme_parser = subparsers.add_parser('supreme', help='Test Supreme Court docket search')
+    supreme_parser.add_argument('docket', help='Supreme Court docket number (A-##-YY format)')
+    supreme_parser.add_argument('--no-save', action='store_true', 
+                              help='Do not save results to database')
+    
+    # ...existing command parsers...
+    
+    return parser  # Make sure to return the parser
 
-    reset_parser = subparsers.add_parser('reset-counter', help='Reset run counter'); reset_parser.set_defaults(func=handle_reset_counter_command)
-    add_schedule_parser = subparsers.add_parser('add-schedule', help='Add a new schedule entry'); add_schedule_parser.set_defaults(func=handle_add_schedule_command)
+def main():
+    """Main entry point for CLI."""
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    try:
+        parser = setup_parser()
+        if not parser:
+            raise ValueError("Failed to create argument parser")
+            
+        args = parser.parse_args()
+        if not args.command:
+            parser.print_help()
+            return
+            
+        if args.command == 'supreme':
+            handle_supreme_command(args)
+        # ...existing command handlers...
+        
+    except Exception as e:
+        log.error(f"CLI error: {e}", exc_info=True)
+        print(f"Error: {e}")
+        sys.exit(1)
 
-    validate_parser = subparsers.add_parser('validate', help='List/validate entries'); validate_parser.set_defaults(func=handle_validate_command)
-    v_group = validate_parser.add_mutually_exclusive_group(required=True); v_group.add_argument('--list-unvalidated', action='store_true'); v_group.add_argument('--list-missing-lc', action='store_true'); v_group.add_argument('--validate-id', type=str, metavar='UID')
-    validate_parser.add_argument('--db', choices=GconfigEM.DEFAULT_DB_NAMES.keys(), default='primary', help='Target DB (default: primary)')
-    updater_parser = subparsers.add_parser('updater', help='(Info) Manual update'); updater_parser.set_defaults(func=handle_updater_command); updater_parser.add_argument('--update-id', type=str, metavar='UID', help='(Info only)')
-    combo_parser = subparsers.add_parser('build-combo-db', help='Rebuild Combo DB'); combo_parser.set_defaults(func=handle_build_combo_db)
-    exit_parser = subparsers.add_parser('exit', help='Stop application'); exit_parser.set_defaults(func=handle_exit_command)
-    # Merge DB Command (No Args)
-    merge_parser = subparsers.add_parser('merge-db', help='Interactively merge data from an older DB.', description='Prompts for inputs. Uses safe backup/temp process.')
-    merge_parser.set_defaults(func=handle_merge_db)
-    # Parse and Execute
-    try: args = parser.parse_args(); args.func(args)
-    except Exception as e: log.critical(f"Arg parse/command error: {e}", exc_info=True); print(f"Error: {e}"); sys.exit(1)
+if __name__ == "__main__":
+    main()
 
 # === End of GcliEM.py ===

@@ -57,6 +57,24 @@ def merge_old_database(source_db_path, target_db_key, source_schema_version):
     target_db_path = db_files.get(target_db_key)
     all_runs_db_path = db_files.get("all_runs")
 
+    try:
+        # Check if target DB exists and is writable
+        if target_db_path and os.path.exists(target_db_path):
+            if not os.access(target_db_path, os.W_OK):
+                log.error(f"Target database {target_db_path} is not writable")
+                print(f"Error: Target database is not writable: {target_db_path}")
+                return False
+        
+        # Check if source DB is readable
+        if not os.access(source_db_path, os.R_OK):
+            log.error(f"Source database {source_db_path} is not readable")
+            print(f"Error: Source database is not readable: {source_db_path}")
+            return False
+    except Exception as e:
+        log.error(f"Error during merge operation: {e}", exc_info=True)
+        print(f"Error during merge: {e}")
+        return False
+
     if not target_db_path:
         log.error(f"Target database key '{target_db_key}' not found in configuration.")
         print(f"Error: Target database '{target_db_key}' not configured.")
