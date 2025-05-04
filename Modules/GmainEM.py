@@ -6,10 +6,16 @@ import os
 import sys
 import logging
 
-# Add Modules directory to path if needed
+# Ensure Modules directory is in path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
+
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 import GcliEM
 

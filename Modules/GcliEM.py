@@ -464,17 +464,25 @@ def handle_supreme_command(args):
 def setup_parser():
     """Sets up command line argument parser."""
     parser = argparse.ArgumentParser(description='ExpectedOps CLI Tool')
-    subparsers = parser.add_subparsers(dest='command', help='Available commands', required=True)
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    # Add supreme search command
+    # Add run command
+    run_parser = subparsers.add_parser('run', help='Run opinion scraping')
+    run_parser.add_argument('--force', action='store_true', help='Force run')
+    run_parser.add_argument('--test', action='store_true', help='Test run')
+    
+    # Add supreme command
     supreme_parser = subparsers.add_parser('supreme', help='Test Supreme Court docket search')
     supreme_parser.add_argument('docket', help='Supreme Court docket number (A-##-YY format)')
     supreme_parser.add_argument('--no-save', action='store_true', 
                               help='Do not save results to database')
     
-    # ...existing command parsers...
+    # Add validate command
+    validate_parser = subparsers.add_parser('validate', help='Validate cases')
+    validate_parser.add_argument('--validate-id', help='Validate specific UniqueID')
+    validate_parser.add_argument('--db', default='primary', help='Target database (primary/backup/test)')
     
-    return parser  # Make sure to return the parser
+    return parser
 
 def main():
     """Main entry point for CLI."""
@@ -486,17 +494,24 @@ def main():
     
     try:
         parser = setup_parser()
-        if not parser:
-            raise ValueError("Failed to create argument parser")
-            
         args = parser.parse_args()
+        
+        # If no command specified, run scheduler (default behavior)
         if not args.command:
-            parser.print_help()
+            log.info("No command specified - starting scheduler")
+            import GschedulerEM
+            GschedulerEM.run_scheduler()
             return
             
-        if args.command == 'supreme':
+        # Handle specific commands
+        if args.command == 'run':
+            handle_run_command(args)
+        elif args.command == 'supreme':
             handle_supreme_command(args)
-        # ...existing command handlers...
+        elif args.command == 'validate':
+            handle_validate_command(args)
+        else:
+            parser.print_help()
         
     except Exception as e:
         log.error(f"CLI error: {e}", exc_info=True)
