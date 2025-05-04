@@ -343,7 +343,8 @@ def handle_merge_db(args):
     target_key = prompt_for_value(target_prompt, validate_target_key, default="test") # Default to test
     if not target_key: print("Cancelled."); return
 
-    def validate_version(v_str): try: v = int(v_str); return (True, v) if v >= 0 else (False, "Must be >= 0.") except ValueError: return False, "Must be an integer."
+    def validate_version(v_str): 
+        try: v = int(v_str); return (True, v) if v >= 0 else (False, "Must be >= 0.") except ValueError: return False, "Must be an integer."
     source_ver = prompt_for_value("Enter SCHEMA VERSION of SOURCE DB (e.g., 1, 2)", validate_version)
     if source_ver is None: print("Cancelled."); return
 
@@ -382,7 +383,8 @@ def handle_merge_db(args):
     else: # Merge function failed or setup failed
         log.error(f"Merge process failed before completion for '{temp_target}'."); print("\nMerge process failed. Check logs.")
         print("Deleting temporary merge file (if exists).");
-        if os.path.exists(temp_target): try: os.remove(temp_target) except OSError as e: log.warning(f"Cannot delete failed temp {temp_target}: {e}")
+        if os.path.exists(temp_target): 
+            try: os.remove(temp_target) except OSError as e: log.warning(f"Cannot delete failed temp {temp_target}: {e}")
     # Cleanup message if necessary
     if not merge_job_success or (confirm2 and confirm2.lower() != 'y'): print("Original target file unchanged. Backups preserved.")
 
