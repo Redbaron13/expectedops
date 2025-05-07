@@ -67,7 +67,39 @@ END;
 
 # --- Schemas for ALL_RUNS, COMBO (Unchanged from V6 - simple structures, no complex migration needed for them yet) ---
 # Schema for GAllRunsOpinionsEM.db ('opinion_history' table)
-ALL_RUNS_SCHEMA = ''' /* ... remains same ... */ '''
+ALL_RUNS_SCHEMA = '''
+CREATE TABLE IF NOT EXISTS opinion_history (
+    RunID INTEGER PRIMARY KEY AUTOINCREMENT,
+    UniqueID TEXT,
+    AppDocketID TEXT,
+    ReleaseDate TEXT,
+    DataHash TEXT,
+    LinkedDocketIDs TEXT,
+    CaseName TEXT,
+    LCdocketID TEXT,
+    LCCounty TEXT,
+    Venue TEXT,
+    LowerCourtVenue TEXT,
+    LowerCourtSubCaseType TEXT,
+    OPJURISAPP TEXT,
+    DecisionTypeCode TEXT,
+    DecisionTypeText TEXT,
+    StateAgency1 TEXT,
+    StateAgency2 TEXT,
+    CaseNotes TEXT,
+    RunType TEXT,
+    entry_method TEXT,
+    validated BOOLEAN,
+    caseconsolidated INTEGER,
+    recordimpounded INTEGER,
+    opinionstatus INTEGER,
+    run_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_history_datahash ON opinion_history (DataHash);
+CREATE INDEX IF NOT EXISTS idx_history_runtype ON opinion_history (RunType);
+CREATE INDEX IF NOT EXISTS idx_history_timestamp ON opinion_history (run_timestamp);
+'''
+
 # Schema for GComboEM.db ('combined_opinions' table) - Updated manually if needed by build_combo_db
 COMBO_SCHEMA = ''' /* ... remains same ... */ '''
 
@@ -287,7 +319,7 @@ def save_opinions_to_dbs(opinion_list, is_validated, run_type):
     """Saves opinions to appropriate databases based on run type."""
     if not opinion_list:
         log.warning("No opinions provided to save.")
-        return {}  # Return empty dict instead of None
+        return {}
     
     results = {}  # Initialize results dict
     
@@ -345,9 +377,111 @@ def save_opinions_to_dbs(opinion_list, is_validated, run_type):
         else:
             log.error(f"Filename missing '{db_k}'.")
 
-    try:
-        # ...rest of the existing code...
-        return results
-    except Exception as e:
-        log.error(f"Error during save operation: {e}", exc_info=True)
-        return {"error": str(e)}  # Return error dict instead of None
+    # Process standard targets (Primary/Backup/Test DBs)
+    for db_key, db_file in std_targets:
+        conn = None
+        try:
+            conn = get_db_connection(db_file)
+            cursor = conn.cursor()
+            
+            for opinion in opinion_list:
+                try:
+                    results[db_key]["total"] += 1
+                    
+                    # Generate unique identifiers
+                    data_hash = generate_data_hash(opinion)
+                    unique_id = generate_unique_id(data_hash, opinion['AppDocketID'])
+                    
+                    # Check if record exists
+                    cursor.execute("SELECT UniqueID, validated FROM opinions WHERE UniqueID = ?", (unique_id,))
+                    existing = cursor.fetchone()
+                    
+                    if existing:
+                        # Update existing record if newly validated
+                        if is_validated and not existing['validated']:
+                            update_sql = """
+                                UPDATE opinions SET 
+                                validated = 1, 
+                                last_validated_run_ts = CURRENT_TIMESTAMP,
+                                entry_method = 'user_validated',
+                                opinionstatus = ?,
+                                DataHash = ?,
+                                LinkedDocketIDs = ?,
+                                CaseNotes = ?,
+                                RunType = ?
+                                WHERE UniqueID = ?
+                            """
+                            cursor.execute(update_sql, (
+                                opinion.get('opinionstatus', 0),
+                                data_hash,
+                                opinion.get('LinkedDocketIDs'),
+                                opinion.get('CaseNotes'),
+                                run_type,
+                                unique_id
+                            ))
+                            results[db_key]["updated"] += 1
+                        else:
+                            results[db_key]["skipped"] += 1
+                    else:
+                        # Insert new record
+                        opinion['UniqueID'] = unique_id
+                        opinion['DataHash'] = data_hash
+                        opinion['RunType'] = run_type
+                        opinion['validated'] = 1 if is_validated else 0
+                        opinion['entry_method'] = 'user_validated' if is_validated else 'scraper'
+                        
+                        placeholders = ', '.join(['?' for _ in opinion.keys()])
+                        columns = ', '.join(opinion.keys())
+                        insert_sql = f"INSERT INTO opinions ({columns}) VALUES ({placeholders})"
+                        
+                        cursor.execute(insert_sql, list(opinion.values()))
+                        results[db_key]["inserted"] += 1
+                        
+                except Exception as e:
+                    log.error(f"Error processing opinion {opinion.get('AppDocketID')}: {e}")
+                    results[db_key]["error"] += 1
+                    
+            conn.commit()
+            log.info(f"DB '{db_key}' processed: {results[db_key]}")
+            
+        except Exception as e:
+            log.error(f"Failed processing DB '{db_key}': {e}", exc_info=True)
+            results[db_key] = {"error": -1}
+        finally:
+            if conn:
+                conn.close()
+    
+    # Process All Runs DB
+    if target_ar:
+        ar_file = db_files.get("all_runs")
+        if ar_file:
+            try:
+                conn = get_db_connection(ar_file)
+                cursor = conn.cursor()
+                
+                # Save run history
+                for opinion in opinion_list:
+                    data_hash = generate_data_hash(opinion)
+                    opinion['DataHash'] = data_hash
+                    opinion['RunType'] = run_type
+                    opinion['validated'] = 1 if is_validated else 0
+                    opinion['run_timestamp'] = datetime.datetime.now().isoformat()
+                    
+                    placeholders = ', '.join(['?' for _ in opinion.keys()])
+                    columns = ', '.join(opinion.keys())
+                    insert_sql = f"INSERT INTO opinion_history ({columns}) VALUES ({placeholders})"
+                    
+                    cursor.execute(insert_sql, list(opinion.values()))
+                
+                conn.commit()
+                results["all_runs"] = {"inserted": len(opinion_list)}
+                log.info(f"History saved: {len(opinion_list)} entries")
+                
+            except Exception as e:
+                log.error(f"Failed saving history: {e}", exc_info=True)
+                results["all_runs"] = {"error": -1}
+            finally:
+                if conn:
+                    conn.close()
+    
+    return results
