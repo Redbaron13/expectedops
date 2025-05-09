@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.venv
+*bin
+*lib
+*pyvenv.cfg
+
 
 # Virtual environment (assuming 'venv')
 venv/
@@ -24,3 +29,5 @@ logs/
 .vscode/
 *.DS_Store
 Prior Databases/GextractexpopsEM.py
+ExpectedOps/venv/bin
+ExpectedOps/venv
