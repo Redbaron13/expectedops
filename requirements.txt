@@ -1,4 +1,5 @@
 requests
+supabase
 beautifulsoup4
 lxml
 schedule
@@ -9,4 +10,5 @@ argparse
 datetime
 python-dateutil
 pandas
+
 
