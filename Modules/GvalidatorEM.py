@@ -1,29 +1,26 @@
 # GvalidatorEM.py
-# V3: Added entry_method update on validation
+# V4: Adapted for Supabase backend.
 """
-Handles manual validation of scraped opinion entries.
+Handles manual validation of scraped opinion entries stored in Supabase.
 Includes display of potential decision PDF URL.
 Allows listing of entries needing LC Docket ID review.
-Updates 'entry_method' upon successful validation.
+Updates 'entry_method' and timestamps upon successful validation.
 """
-import sqlite3
-import shutil
-import os
 import logging
 import re
 import datetime
-import GconfigEM
-import GdbEM # For DB connection and URL construction helper if moved there
+import GconfigEM # Not strictly needed now, but keep for potential future use
+import GdbEM # Supabase version
+from GcliEM import prompt_with_timeout # Use CLI input helper
 
-# Setup logger for this module
 log = logging.getLogger(__name__)
 
-# --- Helper to Construct URL (Keep here or move to GdbEM/utils?) ---
+# --- Helper to Construct URL (Unchanged) ---
 def construct_decision_url(app_docket_id, release_date_str):
     """Constructs the potential URL for a decision PDF."""
-    # ... (implementation is the same as previous version) ...
     if not app_docket_id or not release_date_str:
         return None
+    # Basic cleaning, might need refinement based on actual docket formats
     cleaned_docket = re.sub(r'[^a-z0-9-]', '', app_docket_id.lower())
     try:
         # Ensure date is in YYYY-MM-DD format for parsing
@@ -32,277 +29,221 @@ def construct_decision_url(app_docket_id, release_date_str):
     except (ValueError, TypeError):
         log.warning(f"Could not parse release date '{release_date_str}' to get year for URL construction.")
         return None
+    # Construct the URL based on observed patterns
     url = f"https://www.njcourts.gov/system/files/court-opinions/{release_year}/{cleaned_docket}.pdf"
     return url
 
-
-# --- Main Validation Function (Updated) ---
-def validate_case(unique_id_to_validate, db_key="primary"): # Add db_key parameter
+# --- Main Validation Function (Supabase Version) ---
+def validate_case_supabase(unique_id_to_validate):
     """
-    Allows interactive review and validation of a specific case entry by its UniqueID
-    in the specified database (defaulting to primary). Updates entry_method.
+    Allows interactive review and validation of a specific opinion entry
+    by its UniqueID from the Supabase 'opinions' table. Updates entry_method.
     """
-    log.info(f"Starting validation process for UniqueID: {unique_id_to_validate} in DB: '{db_key}'")
-    db_files = GconfigEM.get_db_filenames()
-    db_filename = db_files.get(db_key)
+    log.info(f"Starting validation process for Opinion UniqueID: {unique_id_to_validate}")
 
-    # Check if the target DB is appropriate for validation (uses 'opinions' schema)
-    db_basename = os.path.basename(db_filename) if db_filename else None
-    allowed_db_keys = ["primary", "backup", "test"] # DBs with the 'opinions' table
-    allowed_db_files = [GconfigEM.DEFAULT_DB_NAMES.get(k) for k in allowed_db_keys]
+    # Fetch the entry from Supabase
+    entry = GdbEM.get_opinion_by_id(unique_id_to_validate)
 
-    if not db_filename:
-        print(f"Error: Database file for '{db_key}' not found in configuration.")
-        log.error(f"Validation failed: DB filename for '{db_key}' missing.")
-        return
-    if db_basename not in allowed_db_files:
-         print(f"Error: Validation can only be performed on Primary, Backup, or Test databases. '{db_key}' ({db_basename}) is not suitable.")
-         log.error(f"Validation failed: Attempted validation on unsuitable DB type '{db_key}' ({db_basename}).")
-         return
-    if not os.path.exists(db_filename):
-        print(f"Error: Database file '{db_filename}' not found.")
-        log.error(f"Validation failed: Database file '{db_filename}' does not exist.")
+    if not entry:
+        print(f"No opinion entry found with UniqueID {unique_id_to_validate} in Supabase.")
+        log.warning(f"validate_case_supabase called for non-existent UniqueID: {unique_id_to_validate}")
         return
 
-    conn = None
-    try:
-        conn = GdbEM.get_db_connection(db_filename)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM opinions WHERE UniqueID = ?", (unique_id_to_validate,))
-        row = cursor.fetchone()
+    original_entry = entry.copy() # Keep original for comparison
 
-        if not row:
-            print(f"No entry found with UniqueID {unique_id_to_validate} in '{db_filename}'.")
-            log.warning(f"validate_case called for non-existent UniqueID: {unique_id_to_validate} in DB {db_key}")
-            return
+    print(f"\n--- Reviewing Opinion Entry UniqueID: {entry['UniqueID'][:8]}... ---")
+    print(f"  Appellate Docket: {entry.get('AppDocketID', 'N/A')}")
+    print(f"  Release Date:     {entry.get('ReleaseDate', 'N/A')}")
+    print(f"  Current Validated Status: {bool(entry.get('validated', False))}") # Default to False if missing
+    print(f"  Current Entry Method:   {entry.get('entry_method', 'N/A')}")
+    print(f"  Last Updated TS:  {entry.get('last_updated_ts', 'N/A')}")
+    print(f"  Validated TS:     {entry.get('last_validated_run_ts', 'N/A')}")
 
-        entry = dict(row)
-        original_entry = entry.copy()
+    # --- Display Potential PDF URL ---
+    pdf_url = construct_decision_url(entry.get('AppDocketID'), entry.get('ReleaseDate'))
+    if pdf_url: print(f"  Potential PDF URL: {pdf_url}")
+    else: print("  (Could not construct potential PDF URL)")
 
-        print(f"\n--- Reviewing Entry UniqueID: {entry['UniqueID'][:8]}... (DB: {db_key}) ---")
-        print(f"  Appellate Docket: {entry.get('AppDocketID', 'N/A')}")
-        print(f"  Release Date:     {entry.get('ReleaseDate', 'N/A')}")
-        print(f"  Current Validated Status: {bool(entry.get('validated', 0))}")
-        print(f"  Current Entry Method:   {entry.get('entry_method', 'N/A')}")
+    print("\n--- Current Data (Editable Fields) ---")
+    # Define fields that are generally editable by the user during validation
+    editable_fields = [
+        'AppDocketID', 'ReleaseDate', 'LinkedDocketIDs', 'CaseName', 'LCdocketID',
+        'LCCounty', 'Venue', 'LowerCourtVenue', 'LowerCourtSubCaseType', 'OPJURISAPP',
+        'DecisionTypeCode', 'DecisionTypeText', 'StateAgency1', 'StateAgency2', 'CaseNotes',
+        'caseconsolidated', 'recordimpounded', 'opinionstatus'
+        # Exclude: UniqueID, DataHash, RunType, entry_method, validated, timestamps (handled separately)
+    ]
 
-        # --- Display Potential PDF URL ---
-        pdf_url = construct_decision_url(entry.get('AppDocketID'), entry.get('ReleaseDate'))
-        if pdf_url: print(f"  Potential PDF URL: {pdf_url}")
-        else: print("  (Could not construct potential PDF URL)")
+    updated_values = {}
+    for key in sorted(editable_fields):
+        current_value = entry.get(key)
+        display_value = current_value if current_value is not None else "[empty]"
+        # Format booleans/integers for display
+        if key in ['caseconsolidated', 'recordimpounded']: display_value = str(bool(current_value))
+        if key == 'opinionstatus': display_value = "Released" if int(current_value) == 1 else "Expected"
 
-        print("\n--- Current Data (Editable Fields) ---")
-        editable_fields = list(entry.keys())
-        non_editable = ['UniqueID', 'DataHash', 'DuplicateFlag', 'first_scraped_ts', 'last_updated_ts', 'last_validated_run_ts', 'RunType', 'entry_method'] # Add entry_method here
-        for key in non_editable:
-            if key in editable_fields: editable_fields.remove(key)
-        # Also don't directly edit validated here, use the prompt below
-        if 'validated' in editable_fields: editable_fields.remove('validated')
+        # Use simple input() here, timeout handled by GcliEM if needed
+        user_input = input(f"  {key:<22}: {display_value} | Edit? (Enter new value or press Enter): ").strip()
 
-        updated_values = {}
-        for key in sorted(editable_fields): # Sort for consistent order
-            current_value = entry.get(key)
-            display_value = current_value if current_value is not None else "[empty]"
-            if key in ['caseconsolidated', 'recordimpounded']: display_value = bool(current_value)
+        if user_input:
+            new_value = user_input
+            # Handle boolean/integer conversion
+            if key in ['caseconsolidated', 'recordimpounded']:
+                if user_input.lower() in ['true', '1', 'yes', 'y']: new_value = True
+                elif user_input.lower() in ['false', '0', 'no', 'n']: new_value = False
+                else:
+                    print(f"    Invalid input for {key} (boolean). Keeping original."); new_value = current_value
+            elif key == 'opinionstatus':
+                 if user_input.lower() in ['released', '1', 'yes', 'y']: new_value = 1
+                 elif user_input.lower() in ['expected', '0', 'no', 'n']: new_value = 0
+                 else:
+                      print(f"    Invalid input for {key} (0 or 1). Keeping original."); new_value = current_value
+            # Add other type conversions if necessary (e.g., dates)
 
-            user_input = input(f"  {key:<22}: {display_value} | Edit? (Enter new value or press Enter): ").strip()
+            # Only record if the value actually changed
+            if new_value != current_value:
+                 updated_values[key] = new_value
+                 entry[key] = new_value # Update the working copy
 
-            if user_input:
-                new_value = user_input
-                if key in ['caseconsolidated', 'recordimpounded']:
-                    if user_input.lower() in ['true', '1', 'yes', 'y']: new_value = 1
-                    elif user_input.lower() in ['false', '0', 'no', 'n']: new_value = 0
-                    else:
-                        print(f"    Invalid input for {key}. Keeping original."); new_value = current_value
-                updated_values[key] = new_value
+    # --- Validation Status ---
+    print("\n--- Validation Status ---")
+    current_validated_status = bool(original_entry.get('validated', False))
+    confirm_validate_input = input(f"Mark this entry as validated? (Current: {current_validated_status}) (y/n/Enter=no change): ").strip().lower()
+    validation_changed = False
+    new_validated_status = current_validated_status # Start with current status
 
-        # --- Validation Status ---
-        entry.update(updated_values) # Apply field edits before asking validation
-        print("\n--- Validation Status ---") 
-        confirm_validate_input = input(f"Mark this entry as validated? (Current: {bool(original_entry['validated'])}) (y/n/Enter=no change): ").strip().lower()
-        validation_changed = False
-        new_validated_status = original_entry['validated']
+    if confirm_validate_input == 'y':
+        new_validated_status = True
+        if not current_validated_status: validation_changed = True # Changed only if it wasn't already true
+        print("Entry will be marked as validated.")
+    elif confirm_validate_input == 'n':
+        new_validated_status = False
+        if current_validated_status: validation_changed = True # Changed only if it wasn't already false
+        print("Entry will be marked as NOT validated.")
+    else:
+        print("Validation status remains unchanged.")
 
-        if confirm_validate_input == 'y':
-            new_validated_status = 1; validation_changed = True; print("Entry will be marked as validated.")
-        elif confirm_validate_input == 'n':
-            new_validated_status = 0; validation_changed = True; print("Entry will be marked as NOT validated.")
+    if validation_changed:
+        updated_values['validated'] = new_validated_status
+        updated_values['last_validated_run_ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat() if new_validated_status else None
+        # Set entry_method if validated
+        if new_validated_status:
+             updated_values['entry_method'] = 'user_validated'
+        # Optional: Revert entry_method if un-validated? For now, keep historical method.
+
+
+    # --- Final confirmation ---
+    if not updated_values: # Check if any changes were actually made
+        print("\nNo changes were made to the entry.")
+        log.info(f"No changes detected for Opinion UniqueID {entry['UniqueID']} during validation.")
+        return
+
+    print("\n--- Summary of Changes ---")
+    for key, value in updated_values.items():
+         original_value = original_entry.get(key)
+         # Format booleans for comparison display
+         if key in ['validated', 'caseconsolidated', 'recordimpounded']:
+              original_display = str(bool(original_value))
+              new_display = str(bool(value))
+         elif key == 'opinionstatus':
+              original_display = "Released" if int(original_value or 0) == 1 else "Expected"
+              new_display = "Released" if int(value) == 1 else "Expected"
+         else:
+              original_display = f"'{original_value}'" if original_value is not None else "[empty]"
+              new_display = f"'{value}'" if value is not None else "[empty]"
+         print(f"  {key}: {original_display} -> {new_display}")
+    if 'validated' in updated_values and updated_values['validated']:
+        print(f"  (entry_method will be set to: 'user_validated')")
+
+
+    confirm_save = input("\nSave these changes to the Supabase database? (y/n): ").strip().lower()
+    if confirm_save == 'y':
+        # Use the GdbEM update function
+        success = GdbEM.update_opinion(entry['UniqueID'], updated_values)
+
+        if success:
+            log.info(f"Opinion UniqueID {entry['UniqueID']} updated successfully in Supabase.")
+            print(f"Opinion UniqueID {entry['UniqueID']} updated successfully.")
         else:
-            print("Validation status remains unchanged.")
+            log.error(f"Failed to update Opinion UniqueID {entry['UniqueID']} in Supabase.")
+            print("Error: Failed to save changes to the database.")
 
-        if validation_changed:
-            entry['validated'] = new_validated_status
-            entry['last_validated_run_ts'] = datetime.datetime.now().isoformat() if new_validated_status == 1 else None
-            # Set entry_method if validated
-            if new_validated_status == 1:
-                 entry['entry_method'] = 'user_validated'
-            # If marked unvalidated, maybe revert entry_method? Or keep historical? Keep for now.
-
-        # --- Final confirmation ---
-        made_changes = bool(updated_values or validation_changed)
-        if not made_changes:
-            print("\nNo changes were made to the entry.")
-            log.info(f"No changes detected for Entry UniqueID {entry['UniqueID']} during validation.")
-            return
-
-        print("\n--- Summary of Changes ---")
-        # ... (display changes - same as before) ...
-        for key, value in updated_values.items():
-             print(f"  {key}: '{original_entry.get(key)}' -> '{value}'")
-        if validation_changed:
-            print(f"  validated: {bool(original_entry['validated'])} -> {bool(entry['validated'])}")
-            if new_validated_status == 1: print(f"  entry_method will be set to: 'user_validated'")
+    else:
+        print("Changes discarded.")
+        log.info(f"User discarded validation changes for Opinion UniqueID {entry['UniqueID']}.")
 
 
-        confirm_save = input("\nSave these changes to the database? (y/n): ").strip().lower()
-        if confirm_save == 'y':
-            # Prepare update query
-            fields_to_update = list(updated_values.keys())
-            if validation_changed:
-                fields_to_update.extend(['validated', 'last_validated_run_ts'])
-                # Always update entry_method if validation happened
-                if 'entry_method' not in fields_to_update: fields_to_update.append('entry_method')
-
-            fields_to_update = list(set(fields_to_update)) # Unique fields
-
-            if not fields_to_update:
-                print("\nNo changes to commit.")
-                log.info(f"No changes to commit for Entry UniqueID {entry['UniqueID']}")
-                return
-
-            set_clauses = ", ".join([f"{key} = ?" for key in fields_to_update])
-            sql_values = [entry.get(key) for key in fields_to_update] + [entry['UniqueID']]
-            sql = f"UPDATE opinions SET {set_clauses} WHERE UniqueID = ?"
-
-            log.debug(f"Executing SQL: {sql} with values: {sql_values}")
-            cursor.execute(sql, tuple(sql_values))
-            conn.commit()
-            log.info(f"Entry UniqueID {entry['UniqueID']} updated in database '{db_filename}'. Validated: {bool(entry['validated'])}, Method: {entry.get('entry_method')}")
-            print(f"Entry UniqueID {entry['UniqueID']} updated successfully.")
-
-        else:
-            print("Changes discarded.")
-            log.info(f"User discarded changes for Entry UniqueID {entry['UniqueID']}.")
-
-    except sqlite3.Error as e:
-        log.error(f"Database error during validation: {e}", exc_info=True)
-        print(f"Database error: {e}")
-        return
-    except ConnectionError as e:
-        log.error(f"Database connection error: {e}", exc_info=True)
-        print(f"Connection error: {e}")
-        return
-    except Exception as e:
-        log.error(f"Unexpected error during validation: {e}", exc_info=True)
-        print(f"An unexpected error occurred: {e}")
-        return
-    finally:
-        if conn:
-            conn.close()
-
-
-# --- list_entries function (Updated to handle db_key) ---
-def list_entries(db_key="primary", list_type="unvalidated", limit=50):
+# --- list_entries function (Supabase Version) ---
+def list_entries_supabase(list_type="unvalidated", limit=50):
     """
-    Lists entries from the specified DB based on criteria:
+    Lists opinion entries from Supabase based on criteria:
     'unvalidated' or 'missing_lc_docket'.
     """
-    log.info(f"Listing entries for DB '{db_key}', type '{list_type}'")
-    db_files = GconfigEM.get_db_filenames()
-    db_filename = db_files.get(db_key)
-
-    # Check if DB is suitable for this listing (uses 'opinions' schema)
-    db_basename = os.path.basename(db_filename) if db_filename else None
-    allowed_db_keys = ["primary", "backup", "test"]
-    allowed_db_files = [GconfigEM.DEFAULT_DB_NAMES.get(k) for k in allowed_db_keys]
-
-    if not db_filename:
-        print(f"Error: Database file for '{db_key}' not found in configuration.")
-        log.error(f"Listing failed: DB filename for '{db_key}' missing.")
-        return
-    if db_basename not in allowed_db_files:
-         print(f"Error: Listing '{list_type}' can only be performed on Primary, Backup, or Test databases. '{db_key}' is not suitable.")
-         log.error(f"Listing failed: Attempted list on unsuitable DB type '{db_key}'.")
-         return
-    if not os.path.exists(db_filename):
-        print(f"Error: Database file '{db_filename}' not found.")
-        log.error(f"Listing failed: Database file '{db_filename}' does not exist.")
+    log.info(f"Listing opinions from Supabase, type '{list_type}'")
+    supabase = GdbEM.get_supabase_client()
+    if not supabase:
+        print("Error: Cannot connect to Supabase.")
         return
 
-    conn = None
+    query = supabase.table('opinions')
+    description = ""
+
+    # Define base fields to select
+    select_fields = "UniqueID, AppDocketID, CaseName, ReleaseDate, LowerCourtVenue, LCdocketID, CaseNotes, entry_method, validated"
+
+    if list_type == "unvalidated":
+        query = query.select(select_fields).eq('validated', False)
+        description = "Unvalidated Opinion Entries"
+    elif list_type == "missing_lc_docket":
+        # Logic: Unvalidated AND (LCdocketID is null OR LCdocketID is empty OR CaseNotes contains marker)
+        # AND not a Supreme Court case (where LC Venue is App Div) AND not an Agency case (where County is NJ)
+        query = query.select(select_fields)\
+                     .eq('validated', False)\
+                     .or_('LCdocketID.is.null,LCdocketID.eq.,CaseNotes.like.%[LC Docket Missing]%')\
+                     .neq('LowerCourtVenue', 'Appellate Division')\
+                     .neq('LCCounty', 'NJ') # Simple exclusion for Agency
+        description = "Unvalidated Opinions Potentially Missing LC Docket ID (Non-SC/Agency)"
+    else:
+        print(f"Error: Unknown list type '{list_type}'. Use 'unvalidated' or 'missing_lc_docket'.")
+        log.error(f"Invalid list_type provided for listing: {list_type}")
+        return
+
     try:
-        conn = GdbEM.get_db_connection(db_filename)
-        cursor = conn.cursor()
+        # Add ordering and limit
+        response = query.order('ReleaseDate', desc=True).order('AppDocketID').limit(limit).execute()
 
-        where_clause = ""
-        params = []
-        description = ""
+        if response.data:
+            rows = response.data
+            print(f"\n--- {description} (Supabase, Max {limit}) ---")
+            # Adjust formatting as needed
+            print(" UniqueID (Start) | Valid | AppDocketID | CaseName (Snippet)               | Release    | LC Venue         | LC Docket        | Entry Method     | Notes (Snippet)")
+            print("------------------|-------|-------------|----------------------------------|------------|------------------|------------------|------------------|--------------------")
+            for entry in rows:
+                uid_s = (entry.get('UniqueID') or '')[:8]
+                val_s = "Y" if entry.get('validated') else "N"
+                app_s = (entry.get('AppDocketID') or 'N/A')[:11]
+                cn_s = (entry.get('CaseName') or '')[:32]
+                rel_s = (entry.get('ReleaseDate') or 'N/A')[:10]
+                lcv_s = (entry.get('LowerCourtVenue') or 'N/A')[:16]
+                lcd_s = (entry.get('LCdocketID') or 'N/A')[:16]
+                em_s = (entry.get('entry_method') or 'N/A')[:16]
+                notes_s = (entry.get('CaseNotes') or '')[:18]
+                if len(entry.get('CaseNotes', '')) > 18: notes_s += "..."
 
-        if list_type == "unvalidated":
-            where_clause = "WHERE validated = 0"
-            description = "Unvalidated Entries"
-        elif list_type == "missing_lc_docket":
-            # Updated check: NULL, empty, OR contains '[LC Docket Missing]' note, AND is unvalidated, AND not SC/Agency
-            where_clause = """
-                WHERE validated = 0
-                  AND (LCdocketID IS NULL OR LCdocketID = '' OR CaseNotes LIKE ?)
-                  AND (LowerCourtVenue IS NULL OR LowerCourtVenue != 'Appellate Division') -- Exclude SC cases
-                  AND (LCCounty IS NULL OR LCCounty != 'NJ') -- Exclude NJ Agency cases
-            """
-            params.append('%[LC Docket Missing]%') # Parameter for LIKE
-            description = "Unvalidated Entries Missing LC Docket ID (Non-SC/Agency)"
+                print(f" {uid_s:<16} | {val_s:<5} | {app_s:<11} | {cn_s:<32} | {rel_s:<10} | {lcv_s:<16} | {lcd_s:<16} | {em_s:<16} | {notes_s}")
+            print("-" * 170) # Adjust width
+            print(f"Found {len(rows)} entries. Use 'validate --validate-id <UniqueID>' to review and edit.")
+
+        elif response.error:
+            print(f"Error querying Supabase: {response.error}")
+            log.error(f"Supabase error listing entries ({list_type}): {response.error}")
         else:
-            print(f"Error: Unknown list type '{list_type}'. Use 'unvalidated' or 'missing_lc_docket'.")
-            log.error(f"Invalid list_type provided: {list_type}")
-            return
+            print(f"No {description.lower()} found matching criteria in Supabase.")
+            log.info(f"list_entries_supabase found no matching entries for type '{list_type}'.")
 
-        # Select key fields
-        query = f"""
-            SELECT UniqueID, AppDocketID, CaseName, ReleaseDate, LowerCourtVenue, LCdocketID, CaseNotes, entry_method
-            FROM opinions
-            {where_clause}
-            ORDER BY ReleaseDate DESC, AppDocketID ASC
-            LIMIT ?
-        """
-        params.append(limit) # Add limit parameter
-
-        log.debug(f"Executing list query on {db_key}: {query} with params: {params}")
-        cursor.execute(query, tuple(params))
-        rows = cursor.fetchall()
-
-        if not rows:
-            print(f"No {description.lower()} found in '{db_filename}'.")
-            log.info(f"list_entries found no matching entries for type '{list_type}' in DB '{db_key}'.")
-            return
-
-        print(f"\n--- {description} (DB: {db_key}, Max {limit}) ---")
-        print(" UniqueID (Start) | AppDocketID | CaseName                         | ReleaseDate  | LC Venue         | LC Docket(s)     | Entry Method     | Notes (Snippet)")
-        print("------------------|-------------|----------------------------------|--------------|------------------|------------------|------------------|--------------------")
-        for row in rows:
-            entry = dict(row)
-            uid_s = (entry['UniqueID'] or '')[:8]
-            cn_s = (entry['CaseName'] or '')[:32]
-            lcv_s = (entry['LowerCourtVenue'] or 'N/A')[:16]
-            lcd_s = (entry['LCdocketID'] or 'N/A')[:16]
-            em_s = (entry['entry_method'] or 'N/A')[:16]
-            notes_s = (entry['CaseNotes'] or '')[:18]
-            if len(entry.get('CaseNotes', '')) > 18: notes_s += "..."
-
-            print(f" {uid_s:<16} | {entry['AppDocketID']:<11} | {cn_s:<32} | {entry['ReleaseDate']:<12} | {lcv_s:<16} | {lcd_s:<16} | {em_s:<16} | {notes_s}")
-        print("-" * 170) # Adjust width
-        print(f"Found {len(rows)} entries. Use 'validate --validate-id <UniqueID> --db {db_key}' to review and edit.")
-
-    # ... (error handling remains the same) ...
-    except sqlite3.Error as e:
-        log.error(f"Database error listing entries ({list_type}) in '{db_filename}': {e}", exc_info=True)
-        print(f"Database error: {e}")
-    except ConnectionError as e:
-        print(f"Database connection error: {e}")
     except Exception as e:
          log.error(f"Unexpected error listing entries ({list_type}): {e}", exc_info=True)
-         print(f"An unexpected error occurred: {e}")
-    finally:
-        if conn:
-            conn.close()
+         print(f"An unexpected error occurred during listing: {e}")
 
 
 # === End of GvalidatorEM.py ===

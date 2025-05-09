@@ -31,3 +31,7 @@ logs/
 Prior Databases/GextractexpopsEM.py
 ExpectedOps/venv/bin
 ExpectedOps/venv
+
+#environments
+.env
+

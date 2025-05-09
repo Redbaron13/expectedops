@@ -1,19 +1,18 @@
 # GcliEM.py
-# V8: Interactive merge-db command with safety checks; Fixed result logging indent.
+# V9: Adapted for Supabase, added calendar processing command.
 """
-Handles CLI commands.
-- `run`: Starts scheduler (default)
-- `run --force`: Runs immediate primary scrape -> primary, all_runs.
-- `run --force --test`: Simulates P1, P2, Backup runs -> all DBs.
-- `status`: Shows status.
-- `configure`: Configures settings.
+Handles CLI commands for the ExpectedOps tool using Supabase backend.
+- `run`: Starts scheduler (default) or forces opinion scraping.
+- `process-calendars`: Parses PDFs from a folder and saves to Supabase.
+- `status`: Shows application status.
+- `configure`: Configures non-sensitive settings (schedule, logging).
 - `reset-counter`: Resets run counter.
-- `validate`: Lists or validates entries.
-- `updater`: (Informational) Explains manual update process.
-- `build-combo-db`: Manually rebuilds the combo DB.
-- `merge-db`: Interactively merges data from an older DB file. # Interactive V8
-- `supreme`: Test Supreme Court docket search.
+- `validate`: Lists or validates opinion entries in Supabase.
+- `supreme`: Test Supreme Court docket search (DB saving needs review).
 - `exit`: Stops the application.
+
+Removed SQLite-specific commands: `build-combo-db`, `merge-db`.
+Removed `updater` command (needs rethink for Supabase).
 """
 import argparse
 import logging
@@ -22,30 +21,24 @@ import threading
 import sys
 import os
 import re
-import shutil # For file operations (copy, move)
+import shutil # Keep for potential future file ops
 import datetime
 from queue import Queue, Empty
 
 # Import project modules
 import GscraperEM
-import GdbEM
-import GstatusEM
+import GdbEM # Supabase version
+import GstatusEM # Supabase version
 import GschedulerEM
-import GconfigEM
-import GvalidatorEM
-import GmergerEM # For merge utility
-import GsupremetestEM
+import GconfigEM # Supabase version
+import GvalidatorEM # Needs Supabase update
+import GsupremetestEM # Needs Supabase update if saving
+import GcalendarParserEM # New
+import GcalendarDbEM # New
 
 log = logging.getLogger(__name__)
 
-# --- Database Roles Clarification ---
-# primary: Holds the most current, validated (or awaiting validation) production dataset, updated by scheduled runs 1 & 2 and manual force runs.
-# backup: Holds a recent production dataset, updated independently by the scheduled backup run. Serves as a secondary source/comparison point.
-# combo: A manually generated combination of the current primary and backup databases for a unified view (built using build-combo-db command). Considered production view.
-# all_runs: Append-only historical archive. Stores a JSON snapshot of every record processed by any run targeting it (scheduled, manual, test, merge). NOT for direct production use, but for historical analysis.
-# test: Non-production database for testing development changes. Data is volatile and not reliable.
-
-# --- Input Handling Helpers ---
+# --- Input Handling Helpers (Unchanged) ---
 def get_input_with_timeout(prompt, timeout, input_queue):
     """Target function for input thread."""
     try:
@@ -63,460 +56,447 @@ def prompt_with_timeout(prompt_text, timeout_seconds=300):
     q = Queue()
     t = threading.Thread(target=get_input_with_timeout, args=(prompt_text, timeout_seconds, q), daemon=True)
     t.start()
-    t.join(timeout=timeout_seconds)
+    t.join(timeout_seconds)
     if t.is_alive():
         print("\nTimeout waiting for input.")
         return None
     else:
         try:
-            # Use get_nowait to avoid blocking if queue is somehow empty after thread joins
             data = q.get_nowait()
             return data.strip() if data is not None else None
         except Empty:
             log.warning("Input thread finished but queue was empty.")
             return None
 
-def prompt_for_value(prompt_text, validation_func=None, error_msg="Invalid input.", default=None):
-    """Helper to repeatedly prompt until valid input is received."""
-    while True:
-        prompt_full = prompt_text
-        if default is not None: # Show default clearly
-            prompt_full += f" [{default}]"
-        prompt_full += ": "
-
-        # Use raw input, handle default after stripping
-        raw_input = input(prompt_full)
-        user_input = raw_input.strip()
-
-        if not user_input and default is not None:
-            user_input = str(default) # Apply default if user just pressed Enter
-
-        if validation_func:
-            is_valid, value_or_error = validation_func(user_input)
-            if is_valid:
-                return value_or_error # Return the validated/converted value
-            else:
-                # Print specific error from validation func if provided
-                print(f"Error: {value_or_error}. {error_msg}")
-                # Loop again
-        elif user_input: # If no validator, just need non-empty input
-             return user_input
-        elif default is not None and not raw_input: # If user hit enter accepting default, and no validator needed
-             return str(default)
-        else: # Input was empty, and no default was applicable
-             print(f"Error: Input cannot be empty. {error_msg}")
-             # Loop again
-
-
 # --- Command Handler Functions ---
 
 def handle_run_command(args):
-    """Handles the 'run' command."""
-    log.info(f"Handling 'run' command. Force: {args.force}, Test: {args.test}")
+    """Handles the 'run' command (Scheduler or Forced Opinion Scrape)."""
+    log.info(f"Handling 'run' command. Force: {args.force}")
+
+    # --- Check Supabase Connectivity ---
+    try:
+        log.info("Checking Supabase connection...")
+        client = GdbEM.get_supabase_client()
+        if not client:
+            print("Error: Cannot connect to Supabase. Check credentials and network.")
+            log.critical("Aborting run command due to Supabase connection failure.")
+            return
+        log.info("Supabase connection check passed.")
+    except Exception as e:
+        print(f"Error: Failed to initialize Supabase client: {e}")
+        log.critical(f"Aborting run command due to Supabase initialization error: {e}", exc_info=True)
+        return
 
     if not args.force:
         # Start Scheduler
-        log.info("Starting scheduler..."); print("Initializing DBs...")
-        try: GdbEM.initialize_all_databases(); GschedulerEM.start_schedule_loop()
-        except Exception as e: log.critical(f"Scheduler start failed: {e}", exc_info=True); print(f"Error starting scheduler: {e}")
+        log.info("No force flag. Starting scheduler loop...")
+        # Initialization is handled within scheduler loop now potentially
+        GschedulerEM.start_schedule_loop()
         return
 
-    # --- Forced Run Logic ---
+    # --- Forced Run Logic (Opinion Scrape) ---
     try:
-        print("Initializing all databases..."); GdbEM.initialize_all_databases()
+        log.info("Force flag set. Running immediate primary opinion scrape.")
+        print("--- Starting Forced Primary Opinion Run ---")
+        run_type_force = 'manual-primary-force'
 
-        if args.test:
-            # --- Test Run (--force --test) ---
-            log.info("Test run requested."); print("--- Starting Test Run Simulation ---")
-            run_type_base = 'manual-test'; is_validated = False
-            # Simulate runs sequentially
-            print("\n[Test] Simulating Primary Run 1...")
-            ops1, _ = GscraperEM.fetch_and_parse_opinions()
-            if ops1: print(f"[Test] Saving {len(ops1)} from P1."); GdbEM.save_opinions_to_dbs(ops1, is_validated, run_type_base + "-p1")
-            else: print("[Test] No opinions found for P1.")
-            time.sleep(0.5)
-            print("\n[Test] Simulating Primary Run 2...")
-            ops2, _ = GscraperEM.fetch_and_parse_opinions()
-            if ops2: print(f"[Test] Saving {len(ops2)} from P2."); GdbEM.save_opinions_to_dbs(ops2, is_validated, run_type_base + "-p2")
-            else: print("[Test] No opinions found for P2.")
-            time.sleep(0.5)
-            print("\n[Test] Simulating Backup Run...")
-            opsB, _ = GscraperEM.fetch_and_parse_opinions()
-            if opsB: print(f"[Test] Saving {len(opsB)} from Backup."); GdbEM.save_opinions_to_dbs(opsB, is_validated, run_type_base + "-bk")
-            else: print("[Test] No opinions found for Backup.")
-            print("\n--- Test Run Complete ---"); log.info("Test run finished.")
+        print(f"Scraping {GscraperEM.PAGE_URL}...")
+        scraped_opinions, release_date = GscraperEM.fetch_and_parse_opinions()
+        if not scraped_opinions:
+            print("No opinions found during scrape.")
+            log.info("Forced run: No opinions found.")
+            return
 
+        # --- Display Scraped Data (Detailed) ---
+        print(f"\n--- Scraped Opinion Data ({len(scraped_opinions)} entries) ---")
+        display_fields = [ # Adjusted field names slightly if needed
+            ('ReleaseDate', '[ReleaseDate] Opinion Release Date'),
+            ('opinionstatus', '[OpinionStatus] Opinion Status'), # 0=Expected, 1=Released
+            ('Venue', '[Venue] Current Venue'),
+            ('CaseName', '[CaseName] Case Caption'),
+            ('AppDocketID', '[AppDocketID] Appellate Division (A.D.) Docket No.'),
+            ('LinkedDocketIDs', '[LinkedDocketIDs] Related A.D. Case No(s).'),
+            ('DecisionTypeCode', '[DecisionTypeCode] Opinion Type Code'),
+            ('DecisionTypeText', '[DecisionTypeText] Opinion Type Text'),
+            ('LCCounty', '[LCCounty] Lower Court County'),
+            ('LCdocketID', '[LCdocketID] LC Docket No(s).'),
+            ('LowerCourtVenue', '[LowerCourtVenue] LC Venue'),
+            ('LowerCourtSubCaseType', '[LowerCourtSubCaseType] LC Sub-Case Type'),
+            ('StateAgency1', '[StateAgency1] State Agency Involved'),
+            ('StateAgency2', '[StateAgency2] Other State Agency Involved'),
+            ('CaseNotes', '[CaseNotes] Case Notes'),
+            ('caseconsolidated', '[caseconsolidated] Consolidated Matter'), # Boolean
+            ('recordimpounded', '[recordimpounded] Record Impounded'), # Boolean
+        ]
+        for i, opinion in enumerate(scraped_opinions):
+            print(f"\n--- Scraped Entry #{i+1} ---")
+            for db_col, label in display_fields:
+                value = opinion.get(db_col)
+                display_value = "N/A"
+                if value is not None:
+                    if db_col in ['caseconsolidated', 'recordimpounded']: display_value = str(bool(value))
+                    elif db_col == 'opinionstatus': display_value = "Released" if int(value) == 1 else "Expected"
+                    else: display_value = str(value)
+                print(f"  {label}: {display_value}")
+            print("-" * 30)
+        print("--- End of Scraped Opinion Data ---")
+
+        # --- Validation Prompt ---
+        validation_timeout = 180
+        prompt_msg = f"\nValidate {len(scraped_opinions)} entries? (y=Yes, n=No/Discard, s/Enter=Skip) [{validation_timeout}s timeout]: "
+        user_response = prompt_with_timeout(prompt_msg, validation_timeout)
+        is_validated, proceed_to_save = False, True
+
+        if user_response is None or user_response.lower() == 's' or user_response == '':
+            print("\nSkipping validation. Data will be saved as unvalidated.")
+            log.info("Validation skipped/timeout during forced run.")
+        elif user_response.lower() == 'y':
+            print("Marked as validated.")
+            log.info("User confirmed data is correct (validated) during forced run.")
+            is_validated = True
+        elif user_response.lower() == 'n':
+            print("Discarding scraped data.")
+            log.info("User discarded scraped data during forced run.")
+            proceed_to_save = False
         else:
-            # --- Standard Force Run (--force only) ---
-            log.info("Standard force run requested."); print("--- Starting Forced Primary Run ---")
-            run_type_force = 'manual-primary-force'
+            print("Invalid input. Skipping validation. Data will be saved as unvalidated.")
+            log.warning(f"Invalid validation input '{user_response}' during forced run.")
 
-            print(f"Scraping {GscraperEM.PAGE_URL}..."); scraped_opinions, release_date = GscraperEM.fetch_and_parse_opinions()
-            if not scraped_opinions: print("No opinions found."); log.info("Forced run: No opinions."); return
+        # --- Save to Supabase ---
+        if proceed_to_save:
+            print("\nSaving opinions to Supabase ('opinions' and 'opinion_history')...")
+            save_results = GdbEM.save_opinions_to_db(scraped_opinions, is_validated, run_type_force)
 
-            # Detailed Output Format
-            print(f"\n--- Scraped Data ({len(scraped_opinions)} entries) ---")
-            display_fields = [
-                ('ReleaseDate', '[ReleaseDate] Opinion Release Date'),
-                ('opinionstatus', '[OpinionStatus] Opinion Status'),
-                ('Venue', '[Venue] Current Venue'),
-                ('CaseName', '[CaseName] Case Caption'),
-                ('AppDocketID', '[AppDocketID] Appellate Division (A.D.) Docket No.'),
-                ('LinkedDocketIDs', '[LinkedDocketIDs] Related A.D. Case No(s).'),
-                ('DecisionTypeCode', '[DecisionTypeCode] Opinion Type Code'),
-                ('DecisionTypeText', '[DecisionTypeText] Opinion Type Text'),
-                ('LCCounty', '[LCCounty] Lower Court County'),
-                ('LCdocketID', '[LCdocketID] LC Docket No(s).'),
-                ('LowerCourtVenue', '[LowerCourtVenue] LC Venue'),
-                ('LowerCourtSubCaseType', '[LowerCourtSubCaseType] LC Sub-Case Type'),
-                ('StateAgency1', '[StateAgency1] State Agency Involved'),
-                ('StateAgency2', '[StateAgency2] Other State Agency Involved'),
-                ('CaseNotes', '[CaseNotes] Case Notes'),
-                ('caseconsolidated', '[caseconsolidated] Consolidated Matter'),
-                ('recordimpounded', '[recordimpounded] Record Impounded'),
-            ]
-            for i, opinion in enumerate(scraped_opinions):
-                print(f"\n--- Scraped Entry #{i+1} ---") # Clear header for each entry
-                for db_col, label in display_fields:
-                    value = opinion.get(db_col)
-                    display_value = "N/A" # Default if value is None or missing
-                    if value is not None: # Format specific fields if value exists
-                        if db_col == 'caseconsolidated': display_value = "Consolidated" if value else "Not Consolidated"
-                        elif db_col == 'recordimpounded': display_value = "Record Impounded" if value else "Record Public"
-                        elif db_col == 'opinionstatus': display_value = "Opinion Released" if value else "Opinion Expected"
-                        elif isinstance(value, (list, tuple)): display_value = ", ".join(map(str, value)) if value else "N/A" # Handle empty lists/tuples
-                        else: display_value = str(value)
-                    print(f"  {label}: {display_value}") # Print label and formatted value
-                print("-" * 30) # Separator line between entries
-            print("--- End of Scraped Data ---")
+            print("\nDatabase processing complete:")
+            print(f"  Opinions Processed: {save_results.get('processed', 0)}")
+            print(f"  Upserted to 'opinions': {save_results.get('upserted', 0)}")
+            print(f"  Errors during upsert: {save_results.get('error', 0)}")
+            print(f"  Saved to 'opinion_history': {save_results.get('history_saved', 0)}")
+            print(f"  Errors during history save: {save_results.get('history_error', 0)}")
+        else:
+            print("Data discarded.")
 
-            # Validation Prompt
-            validation_timeout = 180; prompt_msg = f"\nValidate {len(scraped_opinions)} entries? (y=Yes, n=No/Discard, s/Enter=Skip) [{validation_timeout}s timeout]: "; user_response = prompt_with_timeout(prompt_msg, validation_timeout)
-            is_validated, proceed_to_save = False, True
-            if user_response is None or user_response.lower() == 's' or user_response == '': print("\nSkipping validation."); log.info("Validation skipped/timeout.")
-            elif user_response.lower() == 'y': print("Marked as validated."); log.info("User validated data."); is_validated = True
-            elif user_response.lower() == 'n': print("Discarding data."); log.info("User discarded data."); proceed_to_save = False
-            else: print("Invalid input. Skipping validation."); log.warning(f"Invalid input '{user_response}'.")
+        print("\nForced primary opinion run finished.")
+        log.info("Forced primary opinion run finished.")
 
-            # Save (only to primary and all_runs)
-            if proceed_to_save:
-                print("\nProcessing for Primary and AllRuns databases..."); save_results = GdbEM.save_opinions_to_dbs(scraped_opinions, is_validated, run_type_force)
-                
-                # Initialize save_results to empty dict if None
-                if save_results is None:
-                    save_results = {}
-                    log.warning("Database save operation returned no results.")
+    except Exception as e:
+        log.critical(f"Unexpected error during forced run: {e}", exc_info=True)
+        print(f"An unexpected error occurred during the forced run: {e}")
 
-                print("\nDatabase processing complete:")
-                for db_key in ["primary", "all_runs"]:  # Only care about these two for force run
-                    if db_key in save_results:
-                        result = save_results[db_key]
-                        if isinstance(result, dict) and result.get("error", 0) != -1:
-                            print(f"{db_key.title()} DB: {result.get('inserted', 0)} inserted, "
-                                  f"{result.get('updated', 0)} updated, "
-                                  f"{result.get('skipped', 0)} skipped.")
-                        else:
-                            print(f"{db_key.title()} DB: Error during processing.")
-                    else:
-                        print(f"{db_key.title()} DB: No results reported.")
 
-            else: # User chose not to save
-                print("Data discarded."); log.info("Forced run data discarded.")
+def handle_process_calendars_command(args):
+    """Handles parsing calendar PDFs and saving to Supabase."""
+    log.info("Handling 'process-calendars' command.")
+    input_folder = args.folder
 
-            print("\nForced primary run finished."); log.info("Forced primary run finished.")
+    if not os.path.isdir(input_folder):
+        print(f"Error: Input folder not found or is not a directory: {input_folder}")
+        log.error(f"Calendar processing failed: Invalid input folder '{input_folder}'.")
+        return
 
-    # Error Handling
-    except FileNotFoundError as e: log.error(f"Config missing: {e}", exc_info=True); print("Error: Config file missing.")
-    except KeyError as e: log.error(f"Config key missing: {e}", exc_info=True); print(f"Error: Setting '{e}' missing.")
-    except ConnectionError as e: log.error(f"DB connection fail: {e}", exc_info=True); print(f"Error: DB connection failed: {e}")
-    except Exception as e: log.critical(f"Unexpected error during forced run: {e}", exc_info=True); print(f"Unexpected error: {e}")
+    # --- Check Supabase Connectivity ---
+    try:
+        log.info("Checking Supabase connection...")
+        client = GdbEM.get_supabase_client()
+        if not client:
+            print("Error: Cannot connect to Supabase. Check credentials and network.")
+            log.critical("Aborting calendar processing due to Supabase connection failure.")
+            return
+        log.info("Supabase connection check passed.")
+    except Exception as e:
+        print(f"Error: Failed to initialize Supabase client: {e}")
+        log.critical(f"Aborting calendar processing due to Supabase initialization error: {e}", exc_info=True)
+        return
+
+    output_folder = os.path.join(input_folder, "processed_calendars") # Store processed PDFs in subfolder
+    os.makedirs(output_folder, exist_ok=True)
+
+    pdf_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.pdf') and os.path.isfile(os.path.join(input_folder, f))]
+
+    if not pdf_files:
+        print(f"No PDF files found in folder: {input_folder}")
+        log.info("No PDF calendars found to process.")
+        return
+
+    print(f"Found {len(pdf_files)} PDF files to process in '{input_folder}'.")
+    total_entries_saved = 0
+    total_errors = 0
+    processed_files = 0
+    failed_files = 0
+
+    for pdf_file in pdf_files:
+        full_path = os.path.join(input_folder, pdf_file)
+        print(f"\n--- Processing {pdf_file} ---")
+        try:
+            # Parse the PDF
+            parsed_cases, new_filename = GcalendarParserEM.parse_calendar_pdf(full_path)
+
+            if parsed_cases is None:
+                log.error(f"Failed to parse {pdf_file}. Skipping.")
+                failed_files += 1
+                continue
+
+            if not parsed_cases:
+                log.info(f"No case entries extracted from {pdf_file}. Skipping database save.")
+                # Move file even if no entries extracted, assuming it was processed
+                new_full_path = os.path.join(output_folder, new_filename if new_filename else pdf_file + ".empty")
+                try:
+                    shutil.move(full_path, new_full_path)
+                    log.info(f"Moved empty/processed file {pdf_file} to {output_folder}")
+                except Exception as move_err:
+                    log.error(f"Error moving file {pdf_file} after empty parse: {move_err}")
+                processed_files += 1
+                continue
+
+            # Save extracted data to Supabase
+            print(f"  Extracted {len(parsed_cases)} entries. Saving to Supabase...")
+            save_results = GcalendarDbEM.save_calendar_entries(parsed_cases)
+
+            total_entries_saved += save_results.get('inserted', 0)
+            total_errors += save_results.get('error', 0)
+
+            # Rename and move the processed file
+            if new_filename:
+                new_full_path = os.path.join(output_folder, new_filename)
+                try:
+                    shutil.move(full_path, new_full_path) # Use move instead of rename
+                    print(f"  Successfully processed and moved to {new_filename}")
+                    log.info(f"Processed and moved '{pdf_file}' to '{new_filename}' in {output_folder}.")
+                    processed_files += 1
+                except Exception as move_err:
+                    log.error(f"Error moving processed file {pdf_file} to {new_full_path}: {move_err}")
+                    failed_files += 1 # Count as failure if move fails
+            else:
+                log.error(f"Could not determine new filename for {pdf_file}. File not moved.")
+                failed_files += 1
+
+        except Exception as e:
+            log.error(f"Critical error processing file {pdf_file}: {e}", exc_info=True)
+            print(f"  Error processing file: {e}")
+            failed_files += 1
+
+    print("\n--- Calendar Processing Summary ---")
+    print(f"  PDF Files Processed: {processed_files}")
+    print(f"  PDF Files Failed:    {failed_files}")
+    print(f"  Total Entries Saved: {total_entries_saved}")
+    print(f"  Total DB Errors:     {total_errors}")
+    log.info(f"Calendar processing finished. Files Processed: {processed_files}, Failed: {failed_files}, Entries Saved: {total_entries_saved}, DB Errors: {total_errors}")
 
 
 def handle_status_command(args):
     """Handles the 'status' command."""
     log.info("Handling 'status' command.")
-    GstatusEM.display_status() # Assumes GstatusEM uses new get_db_stats
+    GstatusEM.display_status() # Assumes GstatusEM uses Supabase now
 
 def handle_validate_command(args):
-    """Handles the 'validate' command for listing or validating entries."""
+    """Handles the 'validate' command for listing or validating opinion entries."""
     log.info(f"Handling 'validate' command: {args}")
-    db_key = args.db # Uses default='primary' from argparser
     action_taken = False
-    db_files = GconfigEM.get_db_filenames()
-    db_path = db_files.get(db_key)
-    allowed_keys = ["primary", "backup", "test"] # Target DBs must use the 'opinions' schema
 
-    if db_key not in allowed_keys:
-         print(f"Error: Validation/Listing can only target Primary, Backup, or Test DBs. '{db_key}' is not suitable.")
-         log.error(f"Validate command failed: Invalid target DB '{db_key}'.")
-         return
+    # --- Check Supabase Connectivity ---
+    try:
+        client = GdbEM.get_supabase_client()
+        if not client:
+            print("Error: Cannot connect to Supabase. Check credentials and network.")
+            return
+    except Exception as e:
+        print(f"Error: Failed to initialize Supabase client: {e}")
+        return
 
     if args.list_unvalidated:
-        print(f"Listing unvalidated entries from '{db_key}' DB...")
-        GvalidatorEM.list_entries(db_key=db_key, list_type="unvalidated")
+        print("Listing unvalidated opinion entries from Supabase...")
+        # GvalidatorEM.list_entries needs update for Supabase
+        GvalidatorEM.list_entries_supabase(list_type="unvalidated")
         action_taken = True
     if args.list_missing_lc:
-        print(f"Listing entries potentially missing LC Docket ID from '{db_key}' DB...")
-        GvalidatorEM.list_entries(db_key=db_key, list_type="missing_lc_docket")
+        print("Listing unvalidated opinions potentially missing LC Docket ID...")
+        # GvalidatorEM.list_entries needs update for Supabase
+        GvalidatorEM.list_entries_supabase(list_type="missing_lc_docket")
         action_taken = True
     if args.validate_id:
-         if db_key != "primary": # Optional warning if not validating primary
-              print(f"Warning: Validating entry in non-primary database ('{db_key}'). Changes are isolated.")
-         print(f"Starting interactive validation for UniqueID: {args.validate_id} in '{db_key}' DB...")
-         GvalidatorEM.validate_case(args.validate_id, db_key) # Pass DB key to validator
+         print(f"Starting interactive validation for Opinion UniqueID: {args.validate_id}...")
+         # GvalidatorEM.validate_case needs update for Supabase
+         GvalidatorEM.validate_case_supabase(args.validate_id)
          action_taken = True
 
-    if not action_taken: # Should not happen due to required=True group
-        print("Error: No action specified for 'validate'. Use --list-unvalidated, --list-missing-lc, or --validate-id.")
-        log.error("Validate command handler reached without action flag.")
+    if not action_taken:
+        # This part of the parser setup needs adjustment if validate is optional
+        print("Error: No action specified for 'validate'. Use --list-unvalidated, --list-missing-lc, or --validate-id <ID>.")
+        log.error("Validate command handler reached without required action flag.")
+
 
 def handle_configure_command(args):
-    """Handles the 'configure' command."""
+    """Handles the 'configure' command (Schedule, Logging)."""
     log.info(f"Handling 'configure' command: {args}")
     try:
-        config = GconfigEM.load_config(); updated = False; db_updated = False
-        # DB File Updates
-        for db_type in GconfigEM.DEFAULT_DB_NAMES.keys():
-             arg_name = f"db_{db_type}".replace("_", "-")
-             new_filename = getattr(args, arg_name, None)
-             if new_filename:
-                 if GconfigEM.DB_FILENAME_PATTERN.match(new_filename):
-                     if config['db_files'].get(db_type) != new_filename:
-                         config['db_files'][db_type] = new_filename; print(f"{db_type.capitalize()} DB updated."); db_updated = True
-                 else: print(f"Error: Invalid format for {db_type}: {new_filename}")
-        updated = updated or db_updated
+        config = GconfigEM.load_config()
+        updated = False
+
         # Logging Toggle
         if args.toggle_logging is not None:
-            if config['logging'] != args.toggle_logging:
-                config['logging'] = args.toggle_logging; print(f"Logging set to {args.toggle_logging}."); updated = True
+            # Convert string 'true'/'false' from argparse to boolean
+            new_logging_state = str(args.toggle_logging).lower() == 'true'
+            if config['logging'] != new_logging_state:
+                config['logging'] = new_logging_state
+                print(f"Logging set to {config['logging']}.")
+                updated = True
+
+        # Schedule modification would be more complex - requires adding/removing entries.
+        # Keep it simple for now: only logging toggle via CLI. Schedule managed via config file.
+        if args.add_schedule or args.remove_schedule is not None:
+             print("Info: Schedule modification via CLI is not currently supported.")
+             print("Please edit the 'schedule' section in 'config.json' manually.")
+             log.warning("Schedule modification attempted via CLI - not implemented.")
+
         # Save if changed
-        if updated: GconfigEM.save_config(config); print("Configuration saved.")
-        else: print("No valid configuration changes provided.")
-    except Exception as e: log.error(f"Configure error: {e}", exc_info=True); print("Configure error.")
-
-
-def validate_schedule_entry(entry_str):
-    """Validates a schedule entry string (HH:MM,type,days)."""
-    parts = entry_str.split(",")
-    if len(parts) != 3:
-        return False, "Invalid format. Use 'HH:MM,type,days' (e.g., '14:00,primary-1,Mon-Fri')."
-
-    time_str, run_type, days_str = parts
-    if not re.match(r"^\d{2}:\d{2}$", time_str):
-        return False, "Invalid time format. Use HH:MM."
-
-    allowed_types = ["primary-1", "primary-2", "backup", "other"]  # Add "other" for custom types
-    if run_type not in allowed_types:
-        return False, f"Invalid run type. Choose from: {', '.join(allowed_types)}"
-
-    allowed_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    days = days_str.split("-")
-    if not all(day.capitalize() in allowed_days for day in days):
-        return False, f"Invalid day(s). Use abbreviations (e.g., 'Mon-Fri', 'Sun')."
-
-    return True, {"time": time_str, "type": run_type, "days": days_str}
-
-
-def handle_add_schedule_command(args):
-    """Handles the 'add-schedule' command."""
-    log.info("Handling 'add-schedule' command")
-    entry_str = prompt_for_value("Enter new schedule entry (HH:MM,type,days)", validate_schedule_entry)
-    if entry_str:
-        config = GconfigEM.load_config()
-        config["schedule"].append(entry_str)
-        GconfigEM.save_config(config)
+        if updated:
+            GconfigEM.save_config(config)
+            print("Configuration saved.")
+        else:
+            print("No valid configuration changes provided or applied.")
+    except Exception as e:
+        log.error(f"Configure error: {e}", exc_info=True)
+        print(f"Error during configuration: {e}")
 
 def handle_reset_counter_command(args):
     """Handles the 'reset-counter' command."""
     log.info("Handling 'reset-counter'")
     confirm = prompt_with_timeout("Reset run counter to 0? (y/n): ", 60)
-    if confirm and confirm.lower() == 'y': GconfigEM.reset_run_counter(); print("Counter reset."); log.info("Counter reset.")
-    else: print("Reset cancelled."); log.info("Reset cancelled.")
+    if confirm and confirm.lower() == 'y':
+        GconfigEM.reset_run_counter()
+        print("Run counter reset to 0.")
+        log.info("Run counter reset by user.")
+    else:
+        print("Reset cancelled.")
+        log.info("Run counter reset cancelled by user.")
 
-def handle_build_combo_db(args):
-    """Handles the 'build-combo-db' command."""
-    log.info("Handling 'build-combo-db'"); print("Rebuilding Combo DB...")
+def handle_supreme_command(args):
+    """Handles the supreme search command."""
+    # Note: GsupremetestEM saving to SQLite DB needs removal or update for Supabase
+    log.warning("Supreme Court scraper testing initiated. Database saving behavior might be outdated (SQLite).")
     try:
-        db_files = GconfigEM.get_db_filenames(); combo, primary, backup = db_files.get("combo"), db_files.get("primary"), db_files.get("backup")
-        if not all([combo, primary, backup]): print("Error: DB files missing in config."); return
-        success, msg = GdbEM.build_combo_db(combo, primary, backup)
-        if success: print(f"Rebuilt '{combo}'.")
-        else: print(f"Failed: {msg}")
-    except Exception as e: log.error(f"Build combo error: {e}", exc_info=True); print("Error building combo DB.")
+        # The search logic itself might work, but saving needs review
+        results = GsupremetestEM.search_supreme_docket(
+            args.docket,
+            save_results=False # Disable saving for now until updated
+        )
 
-def handle_updater_command(args):
-    """Handles the conceptual 'updater' command (Informational Only)."""
-    log.info("Handling 'updater'"); print("\n--- Updater Info ---"); print("Auto PDF parsing not available. Use 'validate'."); log.warning("Updater cmd limited.")
-    if args.update_id: print(f" To manually update: `validate --validate-id {args.update_id}`")
+        if results:
+            print("\nSearch Results (from Web Scrape):")
+            print(f"  Supreme Docket: {results.get('sc_docket')}")
+            print(f"  Appellate Docket: {results.get('app_docket')}")
+            print(f"  Case Caption: {results.get('case_name')}")
+            # Add other fields if returned by scraper
+        else:
+            print(f"\nNo results found via web scrape for docket: {args.docket}")
+
+    except Exception as e:
+        log.error(f"Supreme search failed: {e}", exc_info=True)
+        print(f"Error during Supreme Court search: {e}")
+        # sys.exit(1) # Don't exit the whole app if test fails
 
 def handle_exit_command(args):
     """Handles the 'exit' command."""
     log.info("Handling 'exit'"); print("Exiting..."); sys.exit(0)
 
-# --- UPDATED Interactive Handler for Merge DB command ---
-def handle_merge_db(args):
-    """Handles the 'merge-db' command interactively with safety checks."""
-    log.info("Handling 'merge-db' command (Interactive Mode).")
-    print("\n--- Database Merge Utility ---")
-    print("Merges data from an older DB file into primary, backup, or test.")
-    print("NOTE: Target duplicates (same content hash) are SKIPPED.")
-    print("      ALL source records are logged to AllRuns history DB.")
-
-    # --- Get Inputs Interactively ---
-    def validate_source_path(path):
-        abs_path = os.path.abspath(os.path.expanduser(path))
-        return (True, abs_path) if os.path.exists(abs_path) and os.path.isfile(abs_path) and abs_path.lower().endswith('.db') else (False, f"Valid .db file not found: '{path}'")
-    source_path = prompt_for_value("Enter FULL path to SOURCE (older) .db file", validate_source_path)
-    if not source_path: print("Cancelled."); return
-
-    allowed_targets = ["primary", "backup", "test"]; target_prompt = f"Enter TARGET DB key ({'/'.join(allowed_targets)})"
-    def validate_target_key(key): 
-        k = key.lower()
-        return (True, k) if k in allowed_targets else (False, f"Choose from: {', '.join(allowed_targets)}")
-    target_key = prompt_for_value(target_prompt, validate_target_key, default="test") # Default to test
-    if not target_key: print("Cancelled."); return
-
-    def validate_version(v_str):
-        try:
-            v = int(v_str)
-            if v >= 0:
-                return (True, v)
-            else:
-                return (False, "Must be >= 0.")
-        except ValueError:
-            return (False, "Must be an integer.")
-    source_ver = prompt_for_value("Enter SCHEMA VERSION of SOURCE DB (e.g., 1, 2)", validate_version)
-    if source_ver is None: print("Cancelled."); return
-
-    # --- Display Plan and Confirm ---
-    db_files = GconfigEM.get_db_filenames(); target_path = db_files.get(target_key); all_runs_path = db_files.get("all_runs")
-    if not target_path: print(f"Error: Target DB '{target_key}' path missing."); return
-
-    print("\n--- Merge Plan ---"); print(f"Source : {source_path} (V{source_ver})"); print(f"Target : {target_path} ({target_key})"); print(f"History: {all_runs_path or '(Not Configured)'}"); print("Process: 1.Backup 2.TempCopy 3.Merge->Temp 4.Log->History 5.ConfirmReplace"); print("-" * 20)
-    confirm1 = prompt_with_timeout("Proceed with backup & merge to TEMP file? (y/n): ", 60)
-    if not confirm1 or confirm1.lower() != 'y': print("Merge cancelled."); log.info("Merge cancelled (stage 1)."); return
-
-    # --- Execute Safe Merge ---
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    source_backup = f"{source_path}.{timestamp}.bak"; target_backup = f"{target_path}.{timestamp}.bak"; temp_target = f"{target_path}.merge_candidate.{timestamp}.tmp"
-    merge_job_success = False # Tracks if the merge function itself ran ok
-    try: # File Ops & Merge Call
-        print(f"Backing up source -> {os.path.basename(source_backup)}"); shutil.copy2(source_path, source_backup); log.info(f"Src backup: {source_backup}")
-        print(f"Backing up target -> {os.path.basename(target_backup)}"); shutil.copy2(target_path, target_backup); log.info(f"Tgt backup: {target_backup}")
-        print(f"Creating temp target -> {os.path.basename(temp_target)}"); shutil.copy2(target_path, temp_target); log.info(f"Temp target: {temp_target}")
-        print(f"\nAttempting merge into temporary file..."); time.sleep(0.5)
-        # Pass the TEMP path to the merge function
-        merge_job_success = GmergerEM.merge_old_database(source_path, temp_target, source_ver) # Pass temp path
-    except Exception as e: log.error(f"Pre-merge/Merge call error: {e}", exc_info=True); print(f"Error during setup/merge call: {e}"); merge_job_success = False
-
-    # --- Handle Merge Result ---
-    if merge_job_success: # Check if merge function completed without critical failure
-        log.info(f"Merge function completed for temp file '{temp_target}'."); print("\nMerge function completed (check summary above).")
-        print("-" * 20); print(f"Merged : {os.path.basename(temp_target)}"); print(f"Original: {os.path.basename(target_path)}"); print("-" * 20)
-        confirm2 = prompt_with_timeout(f"REPLACE original target '{target_path}' with merged file? (y/n): ", 120)
-        if confirm2 and confirm2.lower() == 'y':
-            try:
-                target_old = f"{target_path}.pre_merge_{timestamp}.old"; print(f"Moving original -> {os.path.basename(target_old)}"); os.rename(target_path, target_old); log.info(f"Original -> {target_old}")
-                print(f"Moving merged -> {os.path.basename(target_path)}"); os.rename(temp_target, target_path); log.info(f"Temp -> {target_path}"); print("\nMerge complete. Target file replaced.")
-            except OSError as e:
-                log.error(f"Error replacing target: {e}", exc_info=True)
-                print(f"Error replacing file: {e}.")
-        else:
-            print("Replace cancelled. Deleting temp."); log.info("User cancelled replace. Deleting temp.")
-            try:
-                os.remove(temp_target)
-            except OSError as e:
-                log.warning(f"Cannot delete temp {temp_target}: {e}")
-    else: # Merge function failed or setup failed
-        log.error(f"Merge process failed before completion for '{temp_target}'."); print("\nMerge process failed. Check logs.")
-        print("Deleting temporary merge file (if exists).")
-        if os.path.exists(temp_target): 
-            try:
-                os.remove(temp_target)
-            except OSError as e:
-                log.warning(f"Cannot delete failed temp {temp_target}: {e}")
-    # Cleanup message if necessary
-    if not merge_job_success or (confirm2 and confirm2.lower() != 'y'): print("Original target file unchanged. Backups preserved.")
-
-def handle_supreme_command(args):
-    """Handles the supreme search command."""
-    try:
-        results = GsupremetestEM.search_supreme_docket(
-            args.docket,
-            save_results=not args.no_save
-        )
-        
-        if results:
-            print("\nSearch Results:")
-            print(f"Supreme Docket: {results.get('sc_docket')}")
-            print(f"Appellate Docket: {results.get('app_docket')}")
-            print(f"Case Caption: {results.get('case_name')}")
-            print(f"County: {results.get('county')}")
-            print(f"State Agency: {results.get('state_agency')}")
-        else:
-            print(f"\nNo results found for docket: {args.docket}")
-            
-    except Exception as e:
-        log.error(f"Supreme search failed: {e}", exc_info=True)
-        print(f"Error during search: {e}")
-        sys.exit(1)
-
+# --- Argument Parser Setup ---
 def setup_parser():
     """Sets up command line argument parser."""
-    parser = argparse.ArgumentParser(description='ExpectedOps CLI Tool')
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    # Add run command
-    run_parser = subparsers.add_parser('run', help='Run opinion scraping')
-    run_parser.add_argument('--force', action='store_true', help='Force run')
-    run_parser.add_argument('--test', action='store_true', help='Test run')
-    
-    # Add supreme command
-    supreme_parser = subparsers.add_parser('supreme', help='Test Supreme Court docket search')
-    supreme_parser.add_argument('docket', help='Supreme Court docket number (A-##-YY format)')
-    supreme_parser.add_argument('--no-save', action='store_true', 
-                              help='Do not save results to database')
-    
-    # Add validate command
-    validate_parser = subparsers.add_parser('validate', help='Validate cases')
-    validate_parser.add_argument('--validate-id', help='Validate specific UniqueID')
-    validate_parser.add_argument('--db', default='primary', help='Target database (primary/backup/test)')
-    
+    parser = argparse.ArgumentParser(
+        description='ExpectedOps CLI Tool - Manage Court Opinion and Calendar Data (Supabase Backend)',
+        formatter_class=argparse.RawTextHelpFormatter # Preserve formatting in help messages
+        )
+    subparsers = parser.add_subparsers(dest='command', help='Available commands', required=False) # Make command optional for default run
+
+    # --- Run Command ---
+    run_parser = subparsers.add_parser('run', help='Run opinion scraping scheduler (default) or force an immediate scrape.')
+    run_parser.add_argument('--force', action='store_true', help='Force immediate opinion scrape and save to Supabase.')
+    # run_parser.add_argument('--test', action='store_true', help='Run a test simulation (Obsolete with Supabase focus).') # Removed test flag
+
+    # --- Process Calendars Command ---
+    calendar_parser = subparsers.add_parser('process-calendars', help='Parse calendar PDFs from a specified folder and save to Supabase.')
+    calendar_parser.add_argument('folder', help='Path to the folder containing calendar PDF files.')
+
+    # --- Status Command ---
+    status_parser = subparsers.add_parser('status', help='Display application status, DB stats, and checks.')
+
+    # --- Validate Command ---
+    validate_parser = subparsers.add_parser('validate', help='List or interactively validate opinion entries.')
+    validate_group = validate_parser.add_mutually_exclusive_group(required=True) # Must choose one action
+    validate_group.add_argument('--list-unvalidated', action='store_true', help='List unvalidated opinions.')
+    validate_group.add_argument('--list-missing-lc', action='store_true', help='List unvalidated opinions potentially missing LC Docket ID.')
+    validate_group.add_argument('--validate-id', metavar='UNIQUE_ID', help='Interactively validate a specific opinion by its UniqueID.')
+    # Removed --db flag as Supabase is the single source now
+
+    # --- Configure Command ---
+    config_parser = subparsers.add_parser('configure', help='Configure application settings (Logging).')
+    config_parser.add_argument('--toggle-logging', choices=['true', 'false'], help='Enable or disable file logging (true/false).')
+    config_parser.add_argument('--add-schedule', help='(Not Implemented) Add schedule entry.', action='store_true')
+    config_parser.add_argument('--remove-schedule', type=int, help='(Not Implemented) Remove schedule entry by index.')
+
+    # --- Reset Counter Command ---
+    reset_parser = subparsers.add_parser('reset-counter', help='Reset the run counter in config.json to 0.')
+
+    # --- Supreme Command ---
+    supreme_parser = subparsers.add_parser('supreme', help='Test Supreme Court docket web search (DB saving disabled).')
+    supreme_parser.add_argument('docket', help='Supreme Court docket number (e.g., A-XX-YY format).')
+    # supreme_parser.add_argument('--no-save', action='store_true', help='(Defaulted) Do not save results to database.') # Keep flag for consistency?
+
+    # --- Exit Command ---
+    exit_parser = subparsers.add_parser('exit', help='Exit the application.')
+
     return parser
 
+# --- Main Execution ---
 def main():
     """Main entry point for CLI."""
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    
+    # Setup logging first
+    try:
+        # Load config minimally to check logging setting
+        temp_config = GconfigEM.load_config()
+        log_enabled = temp_config.get('logging', True)
+        # Setup logger (module GloggerEM needs to exist)
+        import GloggerEM
+        GloggerEM.setup_logging() # Setup based on config
+        log.info("--- CLI Application Started ---")
+    except Exception as log_e:
+        # Fallback basic logging if setup fails
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        log.error(f"Initial logging setup failed: {log_e}", exc_info=True)
+        print(f"Warning: Logging setup failed: {log_e}")
+
     try:
         parser = setup_parser()
         args = parser.parse_args()
-        
-        # If no command specified, run scheduler (default behavior)
-        if not args.command:
-            log.info("No command specified - starting scheduler")
-            import GschedulerEM
-            GschedulerEM.run_scheduler()
+
+        # Default action: Run scheduler if no command is given
+        if args.command is None:
+            log.info("No command specified, defaulting to 'run' (scheduler mode).")
+            # Simulate args for the run command without force
+            class RunArgs: force = False
+            handle_run_command(RunArgs())
             return
-            
-        # Handle specific commands
-        if args.command == 'run':
-            handle_run_command(args)
-        elif args.command == 'supreme':
-            handle_supreme_command(args)
-        elif args.command == 'validate':
-            handle_validate_command(args)
-        else:
+
+        # --- Command Dispatch ---
+        if args.command == 'run': handle_run_command(args)
+        elif args.command == 'process-calendars': handle_process_calendars_command(args)
+        elif args.command == 'status': handle_status_command(args)
+        elif args.command == 'validate': handle_validate_command(args)
+        elif args.command == 'configure': handle_configure_command(args)
+        elif args.command == 'reset-counter': handle_reset_counter_command(args)
+        elif args.command == 'supreme': handle_supreme_command(args)
+        elif args.command == 'exit': handle_exit_command(args)
+        else: # Should not happen if command is required, but good fallback
             parser.print_help()
-        
+
     except Exception as e:
-        log.error(f"CLI error: {e}", exc_info=True)
-        print(f"Error: {e}")
+        log.critical(f"Unhandled error in CLI main: {e}", exc_info=True)
+        print(f"\nAn unexpected critical error occurred: {e}")
         sys.exit(1)
+    finally:
+        log.info("--- CLI Application Finished ---")
+
 
 if __name__ == "__main__":
     main()

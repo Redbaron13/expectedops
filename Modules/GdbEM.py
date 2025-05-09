@@ -1,487 +1,347 @@
 # GdbEM.py
-# V8: Add migration_source_version column and V3 migration logic
+# V9: Rewritten for Supabase backend.
 """
-Handles database interactions.
-- V8: Added migration_source_version column and migration step V2->V3.
-- V7: Implement schema versioning using PRAGMA user_version and migration logic.
-- V6: Added 'opinionstatus' column.
-- V5 Fix: Schema init order; ensure init in build_combo_db.
+Handles database interactions with Supabase.
+Manages connections and data operations for 'opinions' and 'calendar_entries' tables.
 """
-import sqlite3
 import os
 import logging
 import datetime
 import hashlib
 import uuid
-import json
-import GconfigEM
+import GconfigEM # To get Supabase credentials
+from supabase import create_client, Client, PostgrestAPIResponse # Added PostgrestAPIResponse
 
 log = logging.getLogger(__name__)
 
-# --- Schema Version ---
-# Increment this number whenever the OPINIONS_TABLE_SCHEMA changes
-# V1: Original schema before entry_method, opinionstatus
-# V2: Added entry_method, opinionstatus
-# V3: Added migration_source_version
-LATEST_SCHEMA_VERSION = 3
+# --- Supabase Client Initialization ---
+supabase_client: Client | None = None
 
-# --- Database Schemas ---
-# Schema parts for Primary, Backup, Test DBs ('opinions' table)
-OPINIONS_TABLE_DEF = '''
-CREATE TABLE IF NOT EXISTS opinions (
-    UniqueID TEXT PRIMARY KEY, AppDocketID TEXT NOT NULL, ReleaseDate TEXT, DataHash TEXT NOT NULL,
-    DuplicateFlag INTEGER DEFAULT 0, LinkedDocketIDs TEXT, CaseName TEXT, LCdocketID TEXT, LCCounty TEXT,
-    Venue TEXT, LowerCourtVenue TEXT, LowerCourtSubCaseType TEXT, OPJURISAPP TEXT, DecisionTypeCode TEXT,
-    DecisionTypeText TEXT, StateAgency1 TEXT, StateAgency2 TEXT, CaseNotes TEXT, RunType TEXT NOT NULL,
-    entry_method TEXT,          -- Added V2
-    validated BOOLEAN NOT NULL DEFAULT 0,
-    caseconsolidated INTEGER DEFAULT 0,
-    recordimpounded INTEGER DEFAULT 0,
-    opinionstatus INTEGER DEFAULT 0, -- Added V2
-    migration_source_version INTEGER, -- Added V3 (NULL if not migrated)
-    first_scraped_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_validated_run_ts TIMESTAMP
-);
-'''
-
-OPINIONS_INDEXES = '''
-CREATE INDEX IF NOT EXISTS idx_opinions_appdocketid_releasedate ON opinions (AppDocketID, ReleaseDate);
-CREATE INDEX IF NOT EXISTS idx_opinions_datahash ON opinions (DataHash);
-CREATE INDEX IF NOT EXISTS idx_opinions_runtype ON opinions (RunType);
-CREATE INDEX IF NOT EXISTS idx_opinions_validated ON opinions (validated);
-CREATE INDEX IF NOT EXISTS idx_opinions_entrymethod ON opinions (entry_method);
-CREATE INDEX IF NOT EXISTS idx_opinions_opinionstatus ON opinions (opinionstatus);
-CREATE INDEX IF NOT EXISTS idx_opinions_migration_source ON opinions (migration_source_version); -- NEW Index V3
-'''
-
-OPINIONS_TRIGGER = '''
-DROP TRIGGER IF EXISTS trg_opinions_update_timestamp; -- Drop first before creating
-CREATE TRIGGER trg_opinions_update_timestamp
-AFTER UPDATE ON opinions FOR EACH ROW
-WHEN OLD.UniqueID = NEW.UniqueID
-BEGIN
-    UPDATE opinions SET last_updated_ts = CURRENT_TIMESTAMP WHERE UniqueID = OLD.UniqueID;
-END;
-'''
-
-# --- Schemas for ALL_RUNS, COMBO (Unchanged from V6 - simple structures, no complex migration needed for them yet) ---
-# Schema for GAllRunsOpinionsEM.db ('opinion_history' table)
-ALL_RUNS_SCHEMA = '''
-CREATE TABLE IF NOT EXISTS opinion_history (
-    RunID INTEGER PRIMARY KEY AUTOINCREMENT,
-    UniqueID TEXT,
-    AppDocketID TEXT,
-    ReleaseDate TEXT,
-    DataHash TEXT,
-    LinkedDocketIDs TEXT,
-    CaseName TEXT,
-    LCdocketID TEXT,
-    LCCounty TEXT,
-    Venue TEXT,
-    LowerCourtVenue TEXT,
-    LowerCourtSubCaseType TEXT,
-    OPJURISAPP TEXT,
-    DecisionTypeCode TEXT,
-    DecisionTypeText TEXT,
-    StateAgency1 TEXT,
-    StateAgency2 TEXT,
-    CaseNotes TEXT,
-    RunType TEXT,
-    entry_method TEXT,
-    validated BOOLEAN,
-    caseconsolidated INTEGER,
-    recordimpounded INTEGER,
-    opinionstatus INTEGER,
-    run_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_history_datahash ON opinion_history (DataHash);
-CREATE INDEX IF NOT EXISTS idx_history_runtype ON opinion_history (RunType);
-CREATE INDEX IF NOT EXISTS idx_history_timestamp ON opinion_history (run_timestamp);
-'''
-
-# Schema for GComboEM.db ('combined_opinions' table) - Updated manually if needed by build_combo_db
-COMBO_SCHEMA = ''' /* ... remains same ... */ '''
-
-# --- get_db_connection (Unchanged) ---
-def get_db_connection(db_filename):
-    # ... (code remains the same) ...
-    if not db_filename:
-        log.error("DB missing")
-        raise ConnectionError("DB missing")
-    db_dir = os.path.dirname(db_filename)
-    if db_dir and not os.path.exists(db_dir):
+def get_supabase_client():
+    """Initializes and returns the Supabase client singleton."""
+    global supabase_client
+    if supabase_client is None:
+        supabase_url = GconfigEM.get_supabase_url()
+        supabase_key = GconfigEM.get_supabase_key()
+        if not supabase_url or not supabase_key:
+            log.critical("Supabase URL or Key is missing. Cannot connect to database.")
+            raise ConnectionError("Supabase URL or Key environment variables not set.")
         try:
-            os.makedirs(db_dir, exist_ok=True)
-            log.info(f"Created DB dir: {db_dir}")
-        except OSError as e:
-            log.error(f"Failed dir create {db_dir}: {e}")
-            raise ConnectionError("Failed dir create") from e
-    log.debug(f"Connecting to DB: {db_filename}")
-    try:
-        conn = sqlite3.connect(db_filename, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except sqlite3.Error as e:
-        log.error(f"Failed connect {db_filename}: {e}")
-        raise ConnectionError("Could not connect") from e
-
-
-# --- Migration Logic ---
-def _check_column_exists(cursor, table_name, column_name):
-    """Checks if a column exists in a table using PRAGMA table_info."""
-    try:
-        cursor.execute(f"PRAGMA table_info({table_name});")
-        columns = [row['name'] for row in cursor.fetchall()]
-        exists = column_name in columns
-        log.debug(f"Column check: {table_name}.{column_name} exists? {exists}")
-        return exists
-    except sqlite3.Error as e:
-        log.warning(f"Could not check column {table_name}.{column_name}: {e}")
-        return False
-
-def _run_migration(conn, current_version):
-    """Applies migration steps sequentially based on current_version."""
-    cursor = conn.cursor()
-    log.info(f"DB schema version {current_version}. Applying migrations up to V{LATEST_SCHEMA_VERSION}.")
-
-    try:
-        conn.execute("BEGIN;") # Start transaction for migration
-
-        # ----- Migration from Version 1 to Version 2 -----
-        if current_version < 2:
-            log.info("Applying migration V1 -> V2: Add entry_method, opinionstatus.")
-            if not _check_column_exists(cursor, "opinions", "entry_method"):
-                log.debug("Adding column: entry_method TEXT")
-                cursor.execute("ALTER TABLE opinions ADD COLUMN entry_method TEXT;")
-            if not _check_column_exists(cursor, "opinions", "opinionstatus"):
-                log.debug("Adding column: opinionstatus INTEGER DEFAULT 0")
-                cursor.execute("ALTER TABLE opinions ADD COLUMN opinionstatus INTEGER DEFAULT 0;")
-            # No need to recreate indexes/trigger here, do it after all version bumps
-
-        # ----- Migration from Version 2 to Version 3 -----
-        if current_version < 3:
-            log.info("Applying migration V2 -> V3: Add migration_source_version.")
-            if not _check_column_exists(cursor, "opinions", "migration_source_version"):
-                log.debug("Adding column: migration_source_version INTEGER")
-                cursor.execute("ALTER TABLE opinions ADD COLUMN migration_source_version INTEGER;")
-            # No need to recreate indexes/trigger here yet
-
-        # ----- Add future migration steps here -----
-        # if current_version < 4:
-        #    log.info("Applying migration V3 -> V4: ...")
-        #    # Add ALTER TABLE, UPDATE, etc. commands for V4 schema
-
-        # ----- Finalization: Recreate Indexes/Trigger and Update Version -----
-        if current_version < LATEST_SCHEMA_VERSION:
-            log.info("Recreating indexes and trigger after schema modifications...")
-            # Drop indexes (ignore errors) - Use specific index names
-            indexes_to_drop = ["idx_opinions_appdocketid_releasedate", "idx_opinions_datahash", "idx_opinions_runtype", "idx_opinions_validated", "idx_opinions_entrymethod", "idx_opinions_opinionstatus", "idx_opinions_migration_source"]
-            for idx in indexes_to_drop:
-                try:
-                    cursor.execute(f"DROP INDEX IF EXISTS {idx};")
-                except sqlite3.Error as e:
-                    log.warning(f"Ignoring error dropping index {idx}: {e}")
-            # Drop trigger (ignore errors)
-            try:
-                cursor.execute("DROP TRIGGER IF EXISTS trg_opinions_update_timestamp;")
-            except sqlite3.Error as e:
-                log.warning(f"Ignoring error dropping trigger: {e}")
-
-            # Recreate using latest definitions
-            log.debug("Recreating indexes...")
-            cursor.executescript(OPINIONS_INDEXES)
-            log.debug("Recreating trigger...")
-            cursor.executescript(OPINIONS_TRIGGER) # Executes DROP IF EXISTS then CREATE
-
-            # Update version pragma to the latest version
-            log.info(f"Updating database user_version to {LATEST_SCHEMA_VERSION}.")
-            cursor.execute(f"PRAGMA user_version = {LATEST_SCHEMA_VERSION};")
-
-        conn.commit() # Commit migration transaction
-        log.info("Schema migration successful.")
-        return True
-
-    except sqlite3.Error as e:
-        log.error(f"Database migration error during V{current_version} -> V{LATEST_SCHEMA_VERSION}: {e}", exc_info=True)
-        log.warning("Rolling back migration changes.")
-        conn.rollback()
-        return False
-
-# --- initialize_database (Updated for Migration Flow) ---
-def initialize_database(db_filename):
-    """Initializes and migrates the database schema."""
-    log.info(f"Initializing/Migrating database schema: {db_filename}")
-    is_opinions_db = False
-    schema_to_use = None
-    post_create_sql = None # Now only used for non-opinion tables if needed
-    db_basename = os.path.basename(db_filename)
-    db_configs = GconfigEM.DEFAULT_DB_NAMES
-
-    # Determine schema type
-    if db_basename == db_configs.get("all_runs"):
-        schema_to_use = ALL_RUNS_SCHEMA
-        log.info("Using 'opinion_history' schema.")
-    elif db_basename == db_configs.get("combo"):
-        schema_to_use = COMBO_SCHEMA
-        log.info("Using 'combined_opinions' schema.")
-    elif db_basename in [db_configs.get(k) for k in ["primary", "backup", "test"]]:
-        schema_to_use = OPINIONS_TABLE_DEF
-        is_opinions_db = True
-        log.info("Using 'opinions' schema (with migration check).")
-    else:
-        log.warning(f"Unknown DB: {db_basename}. Using default 'opinions' schema.")
-        schema_to_use = OPINIONS_TABLE_DEF
-        is_opinions_db = True
-
-    conn = None
-    try:
-        conn = get_db_connection(db_filename)
-        cursor = conn.cursor()
-
-        if is_opinions_db:
-            log.debug("Checking schema version for opinions DB...")
-            cursor.execute("PRAGMA user_version;")
-            current_version = cursor.fetchone()[0]
-            log.info(f"DB current user_version: {current_version}, Code expects: {LATEST_SCHEMA_VERSION}")
-            # Ensure base table exists *before* migration attempt
-            cursor.execute(OPINIONS_TABLE_DEF)
-            conn.commit() # Commit base table check/creation
-            if current_version < LATEST_SCHEMA_VERSION:
-                if not _run_migration(conn, current_version):
-                    raise sqlite3.Error("Schema migration failed.")
-            else: # Version is current or newer, just ensure indexes/trigger exist
-                log.debug("Schema version OK. Verifying indexes/trigger...")
-                cursor.executescript(OPINIONS_INDEXES)
-                cursor.executescript(OPINIONS_TRIGGER)
-                conn.commit()
-                log.debug("Indexes/trigger verified.")
-        else: # For AllRuns, Combo - just create if not exists
-            log.debug(f"Applying schema directly for {db_basename}...")
-            cursor.executescript(schema_to_use)
-            conn.commit()
-
-        log.info(f"Database '{db_filename}' schema init/migration OK.")
-    except sqlite3.Error as e:
-        log.error(f"DB init/migration error '{db_filename}': {e}", exc_info=True)
-        print(f"DB error {db_filename}: {e}")
-        raise
-    except ConnectionError as e:
-        print(f"DB connection failed {db_filename}: {e}")
-        raise
-    finally:
-        if conn:
-            conn.close()
-
-
-# --- initialize_all_databases (Updated) ---
-def initialize_all_databases():
-    """Initializes/Migrates schemas for all configured databases."""
-    log.info("Initializing/Migrating schemas for all configured databases...")
-    db_files = GconfigEM.get_db_filenames()
-    init_ok = []
-    init_fail = []
-    
-    for db_t, db_f in db_files.items():
-        if not db_f:
-            log.warning(f"Skip init '{db_t}': no filename.")
-            continue
-            
-        try:
-            log.debug(f"Initializing '{db_t}' ('{db_f}')")
-            initialize_database(db_f)
-            init_ok.append(db_f)
+            log.info("Initializing Supabase client...")
+            supabase_client = create_client(supabase_url, supabase_key)
+            # Optional: Test connection (e.g., fetch schema or a dummy record)
+            # response = supabase_client.table('opinions').select('UniqueID', count='exact').limit(1).execute()
+            # if response.count is None: # Check if count is None, indicating potential issue
+            #     log.warning("Supabase connection test failed or 'opinions' table inaccessible.")
+            #     # Decide if this should be a critical error or just a warning
+            # else:
+            #     log.info("Supabase client initialized and connection seems OK.")
+            log.info("Supabase client initialized.") # Keep it simple for now
         except Exception as e:
-            log.error(f"Failed init '{db_f}' ({db_t}): {e}", exc_info=True)
-            init_fail.append(f"{db_f} ({db_t})")
+            log.critical(f"Failed to create Supabase client: {e}", exc_info=True)
+            supabase_client = None # Ensure it stays None on failure
+            raise ConnectionError("Failed to initialize Supabase client") from e
+    return supabase_client
 
-    if init_fail:
-        log.error(f"Failed init DBs: {', '.join(init_fail)}")
-    if init_ok:
-        log.info(f"Successfully init/migrated schemas for: {', '.join(init_ok)}")
-
-
-# --- Data Handling Helpers (Unchanged) ---
-def generate_data_hash(opinion_data): # ...
-    core_data_str = ( f"{opinion_data.get('AppDocketID', '')}|{opinion_data.get('ReleaseDate', '')}|{opinion_data.get('CaseName', '')}|"
-                      f"{opinion_data.get('DecisionTypeCode', '')}|{opinion_data.get('Venue', '')}|{opinion_data.get('LCdocketID', '')}|"
-                      f"{opinion_data.get('LowerCourtVenue', '')}|{opinion_data.get('LowerCourtSubCaseType', '')}|"
-                      f"{opinion_data.get('CaseNotes', '')}|{opinion_data.get('LinkedDocketIDs', '')}" )
+# --- Data Handling Helpers (Hashing/ID Generation - Unchanged Python Logic) ---
+def generate_data_hash(opinion_data):
+    """Generates a SHA256 hash for core opinion data fields."""
+    # Ensure keys exist, default to empty string if missing
+    core_data_str = (
+        f"{opinion_data.get('AppDocketID', '')}|{opinion_data.get('ReleaseDate', '')}|{opinion_data.get('CaseName', '')}|"
+        f"{opinion_data.get('DecisionTypeCode', '')}|{opinion_data.get('Venue', '')}|{opinion_data.get('LCdocketID', '')}|"
+        f"{opinion_data.get('LowerCourtVenue', '')}|{opinion_data.get('LowerCourtSubCaseType', '')}|"
+        f"{opinion_data.get('CaseNotes', '')}|{opinion_data.get('LinkedDocketIDs', '')}"
+    )
     return hashlib.sha256(core_data_str.encode('utf-8')).hexdigest()
-def generate_unique_id(data_hash, app_docket_id): # ...
-    namespace = uuid.NAMESPACE_DNS; name_string = data_hash; base_uuid = uuid.uuid5(namespace, name_string); return str(base_uuid)
-def check_duplicate_by_hash(cursor, data_hash): # ...
-    try: cursor.execute("SELECT 1 FROM opinions WHERE DataHash = ? LIMIT 1", (data_hash,)); return cursor.fetchone() is not None
-    except sqlite3.OperationalError: return False
 
-# --- save_opinions_to_dbs (Updated) ---
-def save_opinions_to_dbs(opinion_list, is_validated, run_type):
-    """Saves opinions to appropriate databases based on run type."""
+def generate_unique_id(data_hash, app_docket_id):
+    """Generates a UUIDv5 based on the data hash."""
+    if not data_hash:
+        log.warning(f"Cannot generate UniqueID without data_hash (AppDocket: {app_docket_id})")
+        return None
+    namespace = uuid.NAMESPACE_DNS # Using DNS namespace as a standard base
+    name_string = data_hash # Use the content hash as the name
+    base_uuid = uuid.uuid5(namespace, name_string)
+    return str(base_uuid)
+
+# --- Database Operations for 'opinions' Table ---
+
+def save_opinions_to_db(opinion_list, is_validated, run_type):
+    """
+    Saves or updates opinions in the Supabase 'opinions' table.
+    Uses 'upsert' for efficiency. Also logs to 'opinion_history'.
+
+    Args:
+        opinion_list (list): List of opinion data dictionaries.
+        is_validated (bool): Whether the data comes from a validated run.
+        run_type (str): Identifier for the type of run (e.g., 'scheduled-primary-1').
+
+    Returns:
+        dict: Summary of operations (inserted/updated count, errors).
+    """
     if not opinion_list:
         log.warning("No opinions provided to save.")
-        return {}
-    
-    results = {}  # Initialize results dict
-    
-    db_files = GconfigEM.get_db_filenames()
-    std_targets = []
-    ar_target = None
-    log.info(f"Save: type '{run_type}'")
-    
-    target_keys_std = []
-    target_ar = False
-    
-    # Determine target DBs based on run type
-    if run_type.startswith('manual-test'):
-        target_keys_std = ["primary", "backup", "test"]
-        target_ar = True
-        log.info("Test run: Target P/B/T + AR.")
-    elif run_type == 'manual-primary-force':
-        target_keys_std = ["primary"]
-        target_ar = True
-        log.info("Force run: Target P + AR.")
-    elif run_type in ['scheduled-primary-1', 'scheduled-primary-2']:
-        target_keys_std = ["primary"]
-        target_ar = True
-        log.info(f"{run_type}: Target P + AR.")
-    elif run_type == 'scheduled-backup':
-        target_keys_std = ["backup"]
-        target_ar = True
-        log.info("Backup run: Target B + AR.")
-    elif run_type == 'user_validated':
-        target_keys_std = ["primary", "backup"]
-        target_ar = True
-        log.info("Validated run: Target P/B + AR.")
-    else:
-        log.warning(f"Unrecognized run '{run_type}'. ONLY history save.")
-        target_keys_std = []
-        target_ar = True
+        return {"inserted": 0, "updated": 0, "skipped": 0, "error": 0, "history_saved": 0, "history_error": 0} # Added history tracking
 
-    # Prepare targets
-    for db_k in target_keys_std:
-        fn = db_files.get(db_k)
-        if fn:
-            try:
-                initialize_database(fn)
-                std_targets.append((db_k, fn))
-                results[db_k] = {
-                    "total": 0,
-                    "inserted": 0,
-                    "updated": 0,
-                    "skipped": 0,
-                    "error": 0
-                }
-            except Exception as e:
-                log.error(f"Failed init DB '{fn}' ({db_k}): {e}")
-                results[db_k] = {"error": -1}
-        else:
-            log.error(f"Filename missing '{db_k}'.")
+    supabase = get_supabase_client()
+    if not supabase:
+        return {"inserted": 0, "updated": 0, "skipped": 0, "error": len(opinion_list), "history_saved": 0, "history_error": 0}
 
-    # Process standard targets (Primary/Backup/Test DBs)
-    for db_key, db_file in std_targets:
-        conn = None
+    records_to_upsert = []
+    records_for_history = []
+    processed_count = 0
+    error_count = 0
+
+    log.info(f"Preparing {len(opinion_list)} opinions for Supabase upsert (run_type: {run_type})...")
+
+    for opinion in opinion_list:
         try:
-            conn = get_db_connection(db_file)
-            cursor = conn.cursor()
-            
-            for opinion in opinion_list:
-                try:
-                    results[db_key]["total"] += 1
-                    
-                    # Generate unique identifiers
-                    data_hash = generate_data_hash(opinion)
-                    unique_id = generate_unique_id(data_hash, opinion['AppDocketID'])
-                    
-                    # Check if record exists
-                    cursor.execute("SELECT UniqueID, validated FROM opinions WHERE UniqueID = ?", (unique_id,))
-                    existing = cursor.fetchone()
-                    
-                    if existing:
-                        # Update existing record if newly validated
-                        if is_validated and not existing['validated']:
-                            update_sql = """
-                                UPDATE opinions SET 
-                                validated = 1, 
-                                last_validated_run_ts = CURRENT_TIMESTAMP,
-                                entry_method = 'user_validated',
-                                opinionstatus = ?,
-                                DataHash = ?,
-                                LinkedDocketIDs = ?,
-                                CaseNotes = ?,
-                                RunType = ?
-                                WHERE UniqueID = ?
-                            """
-                            cursor.execute(update_sql, (
-                                opinion.get('opinionstatus', 0),
-                                data_hash,
-                                opinion.get('LinkedDocketIDs'),
-                                opinion.get('CaseNotes'),
-                                run_type,
-                                unique_id
-                            ))
-                            results[db_key]["updated"] += 1
-                        else:
-                            results[db_key]["skipped"] += 1
-                    else:
-                        # Insert new record
-                        opinion['UniqueID'] = unique_id
-                        opinion['DataHash'] = data_hash
-                        opinion['RunType'] = run_type
-                        opinion['validated'] = 1 if is_validated else 0
-                        opinion['entry_method'] = 'user_validated' if is_validated else 'scraper'
-                        
-                        placeholders = ', '.join(['?' for _ in opinion.keys()])
-                        columns = ', '.join(opinion.keys())
-                        insert_sql = f"INSERT INTO opinions ({columns}) VALUES ({placeholders})"
-                        
-                        cursor.execute(insert_sql, list(opinion.values()))
-                        results[db_key]["inserted"] += 1
-                        
-                except Exception as e:
-                    log.error(f"Error processing opinion {opinion.get('AppDocketID')}: {e}")
-                    results[db_key]["error"] += 1
-                    
-            conn.commit()
-            log.info(f"DB '{db_key}' processed: {results[db_key]}")
-            
+            processed_count += 1
+            # Generate hash and ID
+            data_hash = generate_data_hash(opinion)
+            unique_id = generate_unique_id(data_hash, opinion.get('AppDocketID', 'UNKNOWN'))
+            if not unique_id:
+                log.warning(f"Skipping opinion due to missing UniqueID (AppDocket: {opinion.get('AppDocketID')}).")
+                error_count += 1
+                continue
+
+            # Prepare record for upsert
+            record = opinion.copy() # Work with a copy
+            record['UniqueID'] = unique_id
+            record['DataHash'] = data_hash
+            record['RunType'] = run_type # Record the run type that led to this state
+            record['validated'] = bool(record.get('validated', is_validated)) # Use existing 'validated' if present, else use run status
+            record['entry_method'] = record.get('entry_method', 'scraper') # Keep existing method unless validated
+
+            # Special handling for validation status
+            if is_validated:
+                record['validated'] = True
+                record['entry_method'] = 'user_validated'
+                record['last_validated_run_ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            elif 'validated' not in record: # If not explicitly validated and field missing, default to False
+                 record['validated'] = False
+
+            # Add/Update timestamps - Supabase handles CURRENT_TIMESTAMP via defaults/triggers if set up
+            # We only need to set last_updated_ts explicitly if the trigger isn't used
+            record['last_updated_ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            # first_scraped_ts should ideally be set only on insert. Upsert might overwrite.
+            # A Supabase function/trigger is better for managing 'first_scraped_ts'.
+            # For simplicity here, we'll omit setting it explicitly on upsert.
+
+            # Ensure boolean/integer fields are correct type for Supabase/JSON
+            for bool_field in ['validated', 'caseconsolidated', 'recordimpounded']:
+                 record[bool_field] = bool(record.get(bool_field, 0))
+            for int_field in ['opinionstatus']: # Add other int fields if any
+                 record[int_field] = int(record.get(int_field, 0))
+
+            # Remove fields potentially not in DB or handled by DB (like first_scraped_ts if trigger exists)
+            # record.pop('first_scraped_ts', None)
+
+            records_to_upsert.append(record)
+
+            # Prepare history record (snapshot of current data)
+            history_record = record.copy()
+            history_record['run_timestamp'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            # Remove fields not relevant to history or potentially large/problematic if needed
+            # history_record.pop('some_large_field', None)
+            records_for_history.append(history_record)
+
         except Exception as e:
-            log.error(f"Failed processing DB '{db_key}': {e}", exc_info=True)
-            results[db_key] = {"error": -1}
-        finally:
-            if conn:
-                conn.close()
-    
-    # Process All Runs DB
-    if target_ar:
-        ar_file = db_files.get("all_runs")
-        if ar_file:
-            try:
-                conn = get_db_connection(ar_file)
-                cursor = conn.cursor()
-                
-                # Save run history
-                for opinion in opinion_list:
-                    data_hash = generate_data_hash(opinion)
-                    opinion['DataHash'] = data_hash
-                    opinion['RunType'] = run_type
-                    opinion['validated'] = 1 if is_validated else 0
-                    opinion['run_timestamp'] = datetime.datetime.now().isoformat()
-                    
-                    placeholders = ', '.join(['?' for _ in opinion.keys()])
-                    columns = ', '.join(opinion.keys())
-                    insert_sql = f"INSERT INTO opinion_history ({columns}) VALUES ({placeholders})"
-                    
-                    cursor.execute(insert_sql, list(opinion.values()))
-                
-                conn.commit()
-                results["all_runs"] = {"inserted": len(opinion_list)}
-                log.info(f"History saved: {len(opinion_list)} entries")
-                
-            except Exception as e:
-                log.error(f"Failed saving history: {e}", exc_info=True)
-                results["all_runs"] = {"error": -1}
-            finally:
-                if conn:
-                    conn.close()
-    
-    return results
+            log.error(f"Error preparing opinion {opinion.get('AppDocketID', 'N/A')} for save: {e}", exc_info=True)
+            error_count += 1
+
+    # --- Perform Supabase Upsert for 'opinions' ---
+    upserted_count = 0
+    if records_to_upsert:
+        log.info(f"Upserting {len(records_to_upsert)} records into 'opinions' table...")
+        try:
+            # Assuming 'UniqueID' is the primary key for conflict resolution
+            response: PostgrestAPIResponse = supabase.table('opinions').upsert(records_to_upsert, on_conflict='UniqueID').execute()
+            # Check response structure - Supabase Python client V1 vs V2 might differ
+            # V2 typically returns data in response.data
+            if hasattr(response, 'data') and response.data:
+                 upserted_count = len(response.data)
+                 log.info(f"Supabase upsert response indicates {upserted_count} records processed.")
+                 # Note: Upsert doesn't easily distinguish between insert/update count in the response.
+                 # We report the total processed by upsert. More granular counts would require selects first.
+            elif hasattr(response, 'error') and response.error:
+                 log.error(f"Supabase upsert failed: {response.error}")
+                 error_count += len(records_to_upsert) # Assume all failed if error reported
+            else:
+                 # Handle cases where response might not have data or error (e.g., empty list upserted?)
+                 log.warning(f"Supabase upsert executed but response format unexpected or no data returned. Response: {response}")
+                 # Assume success but log warning, count might be inaccurate
+                 upserted_count = len(records_to_upsert)
+
+
+        except Exception as e:
+            log.error(f"Critical error during Supabase upsert: {e}", exc_info=True)
+            error_count += len(records_to_upsert) # Assume all failed
+
+    # --- Perform Supabase Insert for 'opinion_history' ---
+    history_saved_count = 0
+    history_error_count = 0
+    if records_for_history:
+        log.info(f"Inserting {len(records_for_history)} records into 'opinion_history' table...")
+        try:
+            # History should always be inserts
+            response: PostgrestAPIResponse = supabase.table('opinion_history').insert(records_for_history).execute()
+            if hasattr(response, 'data') and response.data:
+                 history_saved_count = len(response.data)
+                 log.info(f"Successfully inserted {history_saved_count} history records.")
+            elif hasattr(response, 'error') and response.error:
+                 log.error(f"Supabase history insert failed: {response.error}")
+                 history_error_count += len(records_for_history)
+            else:
+                 log.warning(f"Supabase history insert executed but response format unexpected or no data returned. Response: {response}")
+                 # Assume success? Or failure? Assume failure for safety.
+                 history_error_count += len(records_for_history)
+
+        except Exception as e:
+            log.error(f"Critical error during Supabase history insert: {e}", exc_info=True)
+            history_error_count += len(records_for_history)
+
+    # --- Update Run Counter ---
+    if upserted_count > 0 or history_saved_count > 0: # Increment if any DB write occurred
+        try:
+            GconfigEM.increment_run_counter()
+        except Exception as e:
+            log.error(f"Failed to increment run counter: {e}")
+
+    # --- Return Summary ---
+    # Since upsert doesn't distinguish insert/update, we report 'processed' by upsert
+    # and 'skipped' is implicitly handled by the upsert logic (no change if data matches)
+    summary = {
+        "processed": processed_count,
+        "upserted": upserted_count, # Count processed by upsert operation
+        "skipped": processed_count - upserted_count - error_count, # Estimate skips
+        "error": error_count,
+        "history_saved": history_saved_count,
+        "history_error": history_error_count
+    }
+    log.info(f"Opinion save summary: {summary}")
+    return summary
+
+
+def get_opinions_by_date_runtype(release_date, run_type_tag):
+    """Fetches opinions from Supabase matching a specific release date and run type."""
+    supabase = get_supabase_client()
+    if not supabase: return {}
+
+    opinions_dict = {}
+    try:
+        response = supabase.table('opinions')\
+                           .select('AppDocketID, UniqueID, DataHash, validated, CaseName')\
+                           .eq('ReleaseDate', release_date)\
+                           .eq('RunType', run_type_tag)\
+                           .execute()
+
+        if response.data:
+            for row in response.data:
+                opinions_dict[row['AppDocketID']] = row # Store full row data keyed by docket
+            log.info(f"Found {len(opinions_dict)} opinions for date {release_date}, run_type {run_type_tag}")
+        else:
+            log.info(f"No opinions found for date {release_date}, run_type {run_type_tag}")
+            if response.error:
+                 log.error(f"Supabase error fetching opinions by date/runtype: {response.error}")
+
+    except Exception as e:
+        log.error(f"Error fetching opinions by date/runtype: {e}", exc_info=True)
+
+    return opinions_dict
+
+def get_opinion_by_id(unique_id):
+    """Fetches a single opinion by its UniqueID."""
+    supabase = get_supabase_client()
+    if not supabase: return None
+    try:
+        response = supabase.table('opinions').select('*').eq('UniqueID', unique_id).limit(1).execute()
+        if response.data:
+            return response.data[0]
+        else:
+            if response.error:
+                 log.error(f"Supabase error fetching opinion by ID {unique_id}: {response.error}")
+            return None
+    except Exception as e:
+        log.error(f"Error fetching opinion by ID {unique_id}: {e}", exc_info=True)
+        return None
+
+def update_opinion(unique_id, update_data):
+     """Updates specific fields for an opinion by UniqueID."""
+     supabase = get_supabase_client()
+     if not supabase or not update_data: return False
+     try:
+         # Add last_updated_ts automatically
+         update_data['last_updated_ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+         response = supabase.table('opinions').update(update_data).eq('UniqueID', unique_id).execute()
+         if response.data:
+             log.info(f"Successfully updated opinion {unique_id}")
+             return True
+         else:
+             log.error(f"Failed to update opinion {unique_id}. Error: {response.error}")
+             return False
+     except Exception as e:
+         log.error(f"Error updating opinion {unique_id}: {e}", exc_info=True)
+         return False
+
+
+def get_db_stats():
+    """Gets basic statistics (total, validated, unvalidated) from the Supabase 'opinions' table."""
+    supabase = get_supabase_client()
+    stats = {"total": 0, "validated": 0, "unvalidated": 0, "error": None}
+    if not supabase:
+        stats["error"] = "Supabase client not initialized"
+        return stats
+
+    try:
+        # Get total count
+        response_total = supabase.table('opinions').select('UniqueID', count='exact').execute()
+        if response_total.count is not None:
+            stats["total"] = response_total.count
+        else:
+             log.error(f"Supabase error getting total count: {response_total.error}")
+             stats["error"] = f"Failed to get total count: {response_total.error}"
+             return stats # Return early if total count fails
+
+        # Get validated count
+        response_validated = supabase.table('opinions').select('UniqueID', count='exact').eq('validated', True).execute()
+        if response_validated.count is not None:
+            stats["validated"] = response_validated.count
+        else:
+            log.error(f"Supabase error getting validated count: {response_validated.error}")
+            stats["error"] = f"Failed to get validated count: {response_validated.error}"
+            # Don't return early, unvalidated might still work
+
+        # Calculate unvalidated (more efficient than another query if total is accurate)
+        if stats["total"] >= stats["validated"]:
+             stats["unvalidated"] = stats["total"] - stats["validated"]
+        else:
+             # Fallback query if counts seem inconsistent
+             log.warning("Total count less than validated count, querying unvalidated separately.")
+             response_unvalidated = supabase.table('opinions').select('UniqueID', count='exact').eq('validated', False).execute()
+             if response_unvalidated.count is not None:
+                  stats["unvalidated"] = response_unvalidated.count
+             else:
+                  log.error(f"Supabase error getting unvalidated count: {response_unvalidated.error}")
+                  stats["error"] = stats["error"] + f"; Failed to get unvalidated count: {response_unvalidated.error}" if stats["error"] else f"Failed to get unvalidated count: {response_unvalidated.error}"
+
+
+    except Exception as e:
+        log.error(f"Error getting database stats from Supabase: {e}", exc_info=True)
+        stats["error"] = f"Unexpected error: {e}"
+
+    return stats
+
+# === Calendar Database Operations (Placeholder - Implement in GcalendarDbEM.py) ===
+# Functions like save_calendar_entries, get_distinct_judges etc.
+# should be implemented in GcalendarDbEM.py which can import the supabase client from here.
+
+# === Obsolete SQLite Functions (Remove or Comment Out) ===
+# def build_combo_db(...): # Remove
+# def initialize_database(...): # Logic replaced
+# def check_duplicate_by_hash(...): # Logic integrated into save
+
+
+# === End of GdbEM.py ===

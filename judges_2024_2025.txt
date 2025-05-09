@@ -1,0 +1,32 @@
+#judges_2024_2025.txt
+#Judges one per line that comprise the Appellate Division of the New Jersey Superior Court
+
+Sabatino
+Gummer
+Berdote Byrne
+Jacobs
+Jablonski
+Currier
+Marczyk
+Paganelli
+Torregrossa-O'Connor
+Mawla
+Natali Jr
+Walcott-Henderson
+Vinci
+Gooden Brown
+Smith
+Chase
+Vanek
+Gilson
+Firko
+Bishop-Thompson
+Augostini
+Sumners Jr
+Susswein
+Perez Friscia
+Bergman Jr
+Mayer
+Rose
+DeAlmeida
+Puglisi
